@@ -109,6 +109,7 @@ INDEX = HERE / "rag_index.json"       # generated cache — git-ignore it
 # Docs to make searchable. Add your own; missing files are skipped (like context.py's HOMELAB).
 SOURCES = [
     pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md",
+    HERE / "MAG_Z790_TOMAHAWK_MAX_WIFI_User_Guide.md",
 ]
 
 # --- tuning knobs (the RAG equivalent of rules.THRESH — tune for YOUR docs) ---
@@ -398,3 +399,86 @@ will cite the retrieved text instead of guessing.
 That's the whole pipeline: ~120 lines, no new pip packages, one `ollama pull`, one file edited.
 It keeps Watch Tower's promises — local-only, read-only, minimal-dependency — while giving the
 chat model real document grounding instead of a blunt keyword switch.
+
+---
+
+## 7. Better chunking for dense manuals (optional)
+
+The default `_chunk` is a **fixed-size sliding window**. It's predictable and fine for prose
+(homelab notes, runbooks), but it underperforms on **structured technical docs** — a motherboard
+manual full of tables, pinouts, and spec lists — because it slices sections mid-content.
+
+### How to tell it's biting you
+
+Run `--scores` on a real question and read the ranking, not just the top line. Example, asking a
+loaded MSI manual *"what ports do I have on my motherboard?"*:
+
+```
+0.737  [..User_Guide.md] packages (1 set/pack) · 1x Cable sticker ...   <- box contents (noise)
+0.721  [..User_Guide.md] / JUSB3 / JUSB1~2: USB Connectors ...
+0.694  [..User_Guide.md] CPU_PWR1~2 | Pin | Signal ...                  <- pinout, not ports
+...
+0.665  [..User_Guide.md] 1x USB 3.2 Gen 2x2 20Gbps Type-C · 2.5Gbps LAN <- the ACTUAL answer, rank ~11
+```
+
+Three tells, all visible above:
+
+- **The real answer is buried.** The rear-I/O list (USB-C, LAN, Wi-Fi) is rank ~11 — with
+  `TOP_K=4` the model never sees it.
+- **The top hit is noise.** Packaging text out-ranks ports because "USB ports" appears near it.
+- **Scores are compressed** (≈0.47–0.74). That's normal for one dense doc — but it means
+  `MIN_SCORE` is a weak filter here; the ranking, not the absolute score, carries the signal.
+
+Root cause: the 1200-char window splits the manual's tables, so the one coherent "Rear I/O Ports"
+summary gets diluted and out-ranked by a dozen near-duplicate connector/pinout fragments.
+
+### Two ways to fix it
+
+| | Fix | Tradeoff |
+|---|---|---|
+| **A — quick** | Bump `TOP_K` to ~8–10 and retest | Immediate, but blunt: a rank-11 answer needs a big `K`, which drags in more noise and tokens |
+| **B — real fix (recommended for manuals)** | Replace `_chunk` with the **heading-aware** version below, so a section like "Rear I/O Ports" stays one whole chunk and ranks higher | ~15 lines, still zero new deps; best when you'll lean on a structured doc |
+
+### The heading-aware `_chunk` (drop-in replacement)
+
+Paste this over the existing `_chunk` in `rag.py`. Same signature, same `CHUNK_CHARS`/`OVERLAP`
+knobs — it just respects markdown `#` headings instead of cutting blindly.
+
+```python
+def _chunk(text: str) -> list[str]:
+    """Markdown-heading-aware: keep each '#'-section whole so tables / spec lists / pinouts don't
+    get sliced mid-content. Sections bigger than CHUNK_CHARS fall back to the sliding window;
+    tiny adjacent sections are packed together. Better recall on structured docs (manuals)."""
+    parts = re.split(r"(?m)^(?=#{1,6}\s)", text)      # split *before* each heading line
+    sections = [p.strip() for p in parts if p.strip()]
+    step = CHUNK_CHARS - OVERLAP
+    chunks, buf = [], ""
+    for sec in sections:
+        if len(sec) > CHUNK_CHARS:                    # oversized section -> window it
+            if buf:
+                chunks.append(buf); buf = ""
+            chunks += [sec[i:i + CHUNK_CHARS] for i in range(0, len(sec), step)]
+        elif len(buf) + len(sec) + 2 <= CHUNK_CHARS:  # pack small sections together
+            buf = f"{buf}\n\n{sec}" if buf else sec
+        else:                                         # buf full -> flush, start a new one
+            chunks.append(buf); buf = sec
+    if buf:
+        chunks.append(buf)
+    return chunks or [text]
+```
+
+> Works because each chunk now starts at a heading and carries that heading's whole body (table
+> and all). A section longer than `CHUNK_CHARS` still falls back to the windowed split, so nothing
+> is ever dropped. The `python rag.py` self-test still passes (a heading-less 3000-char blob has
+> no headings → one big section → windowed into 3 chunks).
+
+After pasting, **rebuild and retest** — the cache must re-embed with the new chunk boundaries:
+
+```powershell
+python -c "import rag; rag.build_index(force=True)"
+python rag.py --scores "what ports do I have on my motherboard?"
+```
+
+You should see the rear-I/O / connector sections rise toward the top. If a still-relevant chunk
+sits just outside `TOP_K`, nudge `TOP_K` to 5–6 — with whole sections you need far fewer than the
+windowed version did.
