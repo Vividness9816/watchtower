@@ -1,0 +1,400 @@
+# Watch Tower — Add a Local RAG Pipeline (Windows)
+
+A copy-paste guide to add **retrieval-augmented generation** to the chat brain. Right now
+`context.py` injects a whole reference doc behind a keyword gate; this replaces that with proper
+*semantic retrieval* — the chat model gets only the few paragraphs actually relevant to your
+question, pulled from any docs you point it at.
+
+> Prerequisite: a working Watch Tower from [`RECREATE-WINDOWS.md`](RECREATE-WINDOWS.md) (you need
+> `context.py`, `brain.py`, and Ollama running). This guide adds **one new file** (`rag.py`) and
+> edits **one** (`context.py`). `brain.py` does **not** change.
+
+> **Zero new pip dependencies.** Everything `rag.py` uses — `json`, `urllib`, `pathlib`,
+> `hashlib`, `re`, `math` — is the Python standard library. Embeddings come from **Ollama**,
+> which you already run. The only new thing to install is an embedding *model* (a one-line
+> `ollama pull`). The project stays at its three pip deps (`torch`, `gradio`, `pandas`).
+
+---
+
+## 0. What you are building
+
+A 120-line, dependency-free retriever that sits between your question and the chat model:
+
+```
+                          (you already have this)
+ question ─► context.build(message) ─────────────────────────► brain.ask ─► Ollama qwen2.5:32b
+                  │  STATIC FACTS + LIVE SNAPSHOT + FINDINGS                     ▲
+                  │                                                              │
+                  └─► rag.context_block(message)  ◄── NEW                        │
+                          │                                                      │
+              ┌───────────┴───────────┐                                         │
+              ▼                       ▼                                          │
+        embed the question      cosine top-k over    ──► the 4 most relevant ───┘
+        (Ollama embed model)    cached doc vectors        chunks, or nothing
+                                (rag_index.json)           if none clear the bar
+```
+
+**How it works:** your reference docs are split into overlapping chunks, each chunk is turned
+into a vector by a local embedding model once and cached to `rag_index.json`. At question time we
+embed the question, take the cosine similarity against every chunk, and return the top few — but
+only if they clear a relevance floor, so an off-topic question (e.g. "is my GPU hot?") retrieves
+nothing and adds no noise. The cache rebuilds automatically when a source doc changes.
+
+**Still read-only.** Like the rest of Watch Tower, RAG only *selects text to show the model*. It
+never executes anything.
+
+---
+
+## 1. Prerequisites (one model pull)
+
+| Tool | Why | Install |
+|---|---|---|
+| **Watch Tower** (working) | RAG plugs into `context.py` | [`RECREATE-WINDOWS.md`](RECREATE-WINDOWS.md) |
+| **Ollama** (already running) | serves the embedding model locally | already required by the base project |
+| **An embedding model** | turns text into vectors | `ollama pull nomic-embed-text` |
+
+```powershell
+ollama pull nomic-embed-text
+```
+
+Expected (the model is ~270 MB and runs fine on CPU — no VRAM needed):
+
+```
+pulling manifest
+pulling ... 100% ▕████████████████▏ 274 MB
+verifying sha256 digest
+writing manifest
+success
+```
+
+Confirm it's there:
+
+```powershell
+ollama list
+```
+
+```
+NAME                       ID              SIZE      MODIFIED
+nomic-embed-text:latest    0a109f422b47    274 MB    10 seconds ago
+qwen2.5:32b                ...             19 GB     ...
+```
+
+> **Why a dedicated embedding model?** Chat models (like `qwen2.5:32b`) return an *empty* vector
+> from the embeddings endpoint — they have no embedding head exposed. You must use a real embedder
+> (`nomic-embed-text`, or `mxbai-embed-large` for higher quality at ~670 MB).
+
+---
+
+## 2. Create `rag.py`
+
+Paste this into the project root (next to `context.py`). It is self-contained and self-tests with
+`python rag.py`.
+
+```python
+# rag.py — tiny local RAG for Watch Tower. Makes your reference docs (homelab notes, manuals,
+# runbooks) searchable so the chat model can quote the RIGHT few paragraphs instead of being fed
+# a whole document. Embeddings come from Ollama's local embedding model; retrieval is a cosine
+# top-k over a JSON cache. READ-ONLY: it only SELECTS text to show the model.
+#
+# Dependencies: NONE beyond what Watch Tower already needs. json/urllib/pathlib/hashlib/re/math
+# are stdlib; embeddings come from Ollama (already required). New install: `ollama pull nomic-embed-text`.
+
+import json, urllib.request, pathlib, hashlib, re, math, sys
+
+OLLAMA = "http://127.0.0.1:11434/api/embeddings"
+EMBED_MODEL = "nomic-embed-text"      # `ollama pull nomic-embed-text` (~270 MB, runs on CPU)
+HERE = pathlib.Path(__file__).parent
+INDEX = HERE / "rag_index.json"       # generated cache — git-ignore it
+
+# Docs to make searchable. Add your own; missing files are skipped (like context.py's HOMELAB).
+SOURCES = [
+    pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md",
+]
+
+# --- tuning knobs (the RAG equivalent of rules.THRESH — tune for YOUR docs) ---
+CHUNK_CHARS = 1200    # size of each searchable slice (~300 tokens)
+OVERLAP     = 200     # chars repeated between neighbours so a fact on a boundary isn't lost
+TOP_K       = 4       # how many chunks to return per question
+MIN_SCORE   = 0.45    # cosine floor; below this a chunk is "not really relevant" and is dropped
+                      #   -> an off-topic question retrieves nothing. THIS is the knob to tune.
+
+# nomic-embed-text wants these task prefixes; they materially improve retrieval. Other embedders
+# differ: mxbai-embed-large wants only a query-side instruction and no document prefix. If unsure
+# for your model, set both to "" — it works, just slightly weaker on the query side.
+DOC_PREFIX   = "search_document: "
+QUERY_PREFIX = "search_query: "
+
+
+def _embed(text: str, prefix: str = DOC_PREFIX) -> list[float]:
+    """One text -> one L2-normalized vector, via Ollama. Normalized so cosine == dot product."""
+    body = json.dumps({"model": EMBED_MODEL, "prompt": prefix + text}).encode()
+    req = urllib.request.Request(OLLAMA, data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        v = json.loads(r.read())["embedding"]
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+
+def _chunk(text: str) -> list[str]:
+    # ponytail: fixed-size sliding window. Predictable, and OVERLAP covers boundary cuts.
+    # Upgrade to paragraph/markdown-aware splitting only if recall is poor.
+    step = CHUNK_CHARS - OVERLAP
+    return [text[i:i + CHUNK_CHARS] for i in range(0, len(text), step)] or [text]
+
+
+def _load_sources() -> list[tuple[str, str]]:
+    docs = []
+    for p in SOURCES:
+        try:
+            t = p.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue                          # missing file: skip, exactly like context.py
+        if t:
+            docs.append((p.name, t))
+    return docs
+
+
+def _sig(docs) -> str:
+    """Fingerprint of inputs + settings. If it changes, the cache is stale and we re-embed."""
+    h = hashlib.sha256(f"{CHUNK_CHARS}|{OVERLAP}|{EMBED_MODEL}".encode())
+    for name, text in docs:
+        h.update(name.encode()); h.update(text.encode("utf-8", "replace"))
+    return h.hexdigest()
+
+
+def build_index(force: bool = False) -> dict:
+    """Embed every chunk of every source doc, cached to rag_index.json. Rebuilds on doc change."""
+    docs = _load_sources()
+    sig = _sig(docs)
+    if not force and INDEX.exists():
+        cached = json.loads(INDEX.read_text(encoding="utf-8"))
+        if cached.get("sig") == sig:
+            return cached                     # docs unchanged -> reuse the embeddings
+    chunks, sources = [], []
+    for name, text in docs:
+        for c in _chunk(text):
+            chunks.append(c); sources.append(name)
+    vecs = [_embed(c) for c in chunks]        # one HTTP call per chunk (cached after this run)
+    idx = {"sig": sig, "chunks": chunks, "sources": sources, "vecs": vecs}
+    INDEX.write_text(json.dumps(idx), encoding="utf-8")
+    return idx
+
+
+def _scored(question: str):
+    """All chunks scored against the question, highest cosine first."""
+    idx = build_index()
+    if not idx["chunks"]:
+        return []
+    q = _embed(question, QUERY_PREFIX)
+    out = [(sum(a * b for a, b in zip(q, v)), i) for i, v in enumerate(idx["vecs"])]
+    out.sort(reverse=True)                     # ponytail: linear scan; fine to a few thousand
+    return [(s, i, idx) for s, i in out]       # chunks. Past that, reach for numpy / a vector DB.
+
+
+def retrieve(question: str, k: int = TOP_K, min_score: float = MIN_SCORE) -> list[str]:
+    """Up to k reference chunks relevant to the question. Empty if nothing clears min_score."""
+    hits = _scored(question)[:k]
+    return [f"[{idx['sources'][i]}] {idx['chunks'][i]}" for s, i, idx in hits if s >= min_score]
+
+
+def context_block(question: str) -> str:
+    """Ready-to-inject grounding text for context.build(); '' when nothing is relevant.
+    NEVER raises: if Ollama is down or the embed model isn't pulled, retrieval degrades to ''
+    so the chat keeps working (static facts + live snapshot + findings still ground the answer).
+    This is what lets context.build() — called OUTSIDE brain.ask's try/except — stay crash-proof."""
+    try:
+        hits = retrieve(question)
+    except Exception:
+        return ""                              # Ollama unavailable / model not pulled -> no docs
+    if not hits:
+        return ""
+    return ("REFERENCE DOCS (retrieved as most relevant to this question — quote these):\n\n"
+            + "\n\n---\n\n".join(hits))
+
+
+def demo():  # the one runnable check
+    # offline: chunking + cosine math work with no Ollama running
+    assert len(_chunk("x" * 3000)) >= 3, "sliding-window chunker is wrong"
+    v = [0.6, 0.8]                             # a unit vector's cosine with itself must be 1
+    assert abs(sum(a * b for a, b in zip(v, v)) - 1.0) < 1e-6, "cosine math wrong"
+    print("rag chunk/math ok")
+    try:                                       # online: only if Ollama + the model are present
+        n = len(build_index()["chunks"])
+        hits = retrieve("how is my reverse proxy / homelab networking set up?")
+        print(f"rag index ok: {n} chunks; query returned {len(hits)} relevant chunk(s)")
+        if hits:
+            print("top hit:", hits[0][:160].replace("\n", " "))
+    except Exception as e:
+        print(f"(skipped live retrieve - is Ollama up + `ollama pull {EMBED_MODEL}` done? {e})")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "--scores":   # calibrate MIN_SCORE
+        for s, i, idx in _scored(sys.argv[2]):
+            print(f"{s:.3f}  [{idx['sources'][i]}] {idx['chunks'][i][:90].strip()}")
+    else:
+        demo()
+```
+
+Set `SOURCES` to the docs you want searchable — point it at your homelab notes, a hardware
+manual you've saved as `.md`/`.txt`, a runbook, anything. Missing files are silently skipped, so
+it's safe to list docs that don't exist yet.
+
+Self-test it:
+
+```powershell
+python rag.py
+```
+
+Example output (with `nomic-embed-text` pulled and a real `SOURCES` doc present; your counts and
+scores will differ):
+
+```
+rag chunk/math ok
+rag index ok: 37 chunks; query returned 4 relevant chunk(s)
+top hit: [HOMELAB-COMPLETE-SETUP.md] ## Reverse proxy ...
+```
+
+If Ollama is down or the model isn't pulled, the first line still prints and the rest degrades to
+a one-line skip — the offline logic is proven without the model.
+
+---
+
+## 3. Wire it into `context.py` (this is "how the LLM uses it")
+
+The chat brain already grounds every answer in `context.build(message)` — that string becomes the
+`{ctx}` in `brain.SYSTEM`. So the only change needed is to have `build()` append retrieved chunks.
+**RAG replaces the old keyword gate** (`_wants_homelab` / `HOMELAB_TRIGGERS`): semantic similarity
+does the relevance decision now, so the keyword list and the whole-doc dump go away.
+
+> **Tradeoff to know:** the old gate dumped the *entire* doc (~9k tokens) on any keyword match;
+> RAG injects only the `TOP_K` best chunks. That's a precision win for focused questions but feeds
+> the model less on broad "give me the whole picture" ones. Raise `TOP_K` if you want more
+> coverage — it's a precision/recall dial, not a strict upgrade over the blunt switch.
+
+**3a.** Add the import at the top of `context.py`:
+
+```python
+import json, pathlib
+import rules
+import rag                      # NEW
+```
+
+**3b.** Replace the tail of `build()` — delete the `_wants_homelab` block and inject RAG instead:
+
+```python
+def build(message: str = "") -> str:
+    snap, findings = snapshot_and_findings()
+    parts = [
+        "STATIC FACTS ABOUT THIS MACHINE:",
+        _read(FACTS) or "(no system_facts.md)",
+        "",
+        "LIVE SNAPSHOT (JSON, just collected):",
+        json.dumps(snap, indent=2),
+        "",
+        "FINDINGS (deterministic ground truth from rules.py — trust these over guesses):",
+        json.dumps(findings, indent=2) if findings else "none — all nominal",
+    ]
+    refs = rag.context_block(message)      # semantic retrieval replaces the keyword gate
+    if refs:
+        parts += ["", refs]
+    return "\n".join(parts)
+```
+
+**3c.** Delete the now-dead gate (the `HOMELAB`, `HOMELAB_TRIGGERS`, and `_wants_homelab` lines)
+and move that doc path into `rag.SOURCES` instead (step 2). Update the `__main__` self-test, which
+referenced `_wants_homelab`:
+
+```python
+if __name__ == "__main__":
+    out = build("how is my reverse proxy set up?")
+    assert "FINDINGS" in out, "context block lost its findings"
+    print(out[:800])
+```
+
+That's the entire integration. **`brain.py` is unchanged** — it calls `context.build(user_text)`,
+gets the static facts + live snapshot + findings + *the retrieved chunks*, and passes the whole
+thing as the system prompt. The model now quotes the right paragraphs of your docs automatically,
+on the questions where they're relevant, and ignores them otherwise.
+
+---
+
+## 4. Verify end to end
+
+```powershell
+python context.py
+```
+
+A homelab-style question pulls reference chunks into the context (you'll see a
+`REFERENCE DOCS (...)` section in the printed block); a pure-hardware question won't.
+
+Tune the relevance floor with the score view — it prints every chunk's cosine so you can pick a
+`MIN_SCORE` between "clearly relevant" and "noise":
+
+```powershell
+python rag.py --scores "how is traefik configured?"
+```
+
+Example output (illustrative scores):
+
+```
+0.71  [HOMELAB-COMPLETE-SETUP.md] ## Reverse proxy (Traefik) ...
+0.68  [HOMELAB-COMPLETE-SETUP.md] ### Traefik dynamic config ...
+0.39  [HOMELAB-COMPLETE-SETUP.md] ## Backups ...
+0.31  [HOMELAB-COMPLETE-SETUP.md] ## Hardware inventory ...
+```
+
+Here `0.45` cleanly separates the two real hits from the noise. Raise `MIN_SCORE` if junk leaks
+in; lower it if relevant docs are being missed.
+
+Then just use the chat as normal — CLI or web:
+
+```powershell
+python chat.py        # or: python app.py
+```
+
+Ask something covered by your docs ("what port does my reverse proxy listen on?") and the answer
+will cite the retrieved text instead of guessing.
+
+---
+
+## 5. Tuning & maintenance
+
+| Knob (in `rag.py`) | Default | Raise it / change it when |
+|---|---|---|
+| `SOURCES` | one homelab doc | add every `.md`/`.txt` you want searchable |
+| `MIN_SCORE` | `0.45` | **the main dial.** Higher = stricter (less noise, risk of missing); lower = looser |
+| `TOP_K` | `4` | answers need more context; watch you don't blow `num_ctx` in `brain.py` |
+| `CHUNK_CHARS` / `OVERLAP` | `1200` / `200` | smaller chunks = finer retrieval; bigger = more context per hit |
+| `EMBED_MODEL` | `nomic-embed-text` | want higher quality → `mxbai-embed-large` (~670 MB; adjust the prefixes — see the prefix note in `rag.py`) |
+
+- **The cache rebuilds itself.** `rag_index.json` is keyed by a hash of your docs + settings;
+  edit a source doc (or any knob above) and the next call re-embeds automatically. To force it:
+  `python -c "import rag; rag.build_index(force=True)"`.
+- **First call after a doc edit is slower** (one embed call per chunk) — for a typical doc that's
+  a second or two, then it's instant from cache.
+- **Git-ignore the cache.** Add it to `.gitignore`:
+
+  ```
+  rag_index.json
+  ```
+
+---
+
+## 6. Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `HTTP Error 404` on embed | model not pulled — run `ollama pull nomic-embed-text`; check `ollama list` |
+| `embedding dims = 0` / retrieval always empty | you pointed `EMBED_MODEL` at a **chat** model. Use a real embedder (`nomic-embed-text`) |
+| Retrieval returns nothing for relevant questions | `MIN_SCORE` too high, or `SOURCES` path wrong / file missing. Use `python rag.py --scores "..."` to see actual scores |
+| Off-topic questions still pull doc chunks | `MIN_SCORE` too low — raise it |
+| Slow chat after editing a doc | expected: it's re-embedding once; cached afterwards |
+| Want batch/faster indexing | newer Ollama has `/api/embed` (takes `"input": [..]` and returns `"embeddings": [[..]]`) — swap the endpoint to embed all chunks in one call |
+
+---
+
+That's the whole pipeline: ~120 lines, no new pip packages, one `ollama pull`, one file edited.
+It keeps Watch Tower's promises — local-only, read-only, minimal-dependency — while giving the
+chat model real document grounding instead of a blunt keyword switch.

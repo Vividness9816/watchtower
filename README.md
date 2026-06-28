@@ -85,6 +85,8 @@ Full, copy-paste, step-by-step guides with expected output for every command:
 
 - **Windows:** [`docs/RECREATE-WINDOWS.md`](docs/RECREATE-WINDOWS.md)
 - **Linux:** [`docs/RECREATE-LINUX.md`](docs/RECREATE-LINUX.md)
+- *(optional)* **Add local RAG to the chat:** [`docs/ADD-RAG.md`](docs/ADD-RAG.md) — semantic
+  retrieval over your own reference docs, zero new pip deps (one `ollama pull`)
 
 The short version:
 
