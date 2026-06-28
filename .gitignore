@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Trained model checkpoint + runtime data (regenerable; large or machine-specific)
+ckpt.pt
+*.pt
+*.safetensors
+history.db
+*.db-journal
+
+# Secrets / env
+.env
+.env.*
+
+# OS cruft
+Thumbs.db
+.DS_Store
