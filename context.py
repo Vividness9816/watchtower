@@ -2,13 +2,13 @@ import json, pathlib
 import rules
 
 FACTS = pathlib.Path(__file__).parent / "system_facts.md"
-HOMELAB = pathlib.Path(r"C:\Users\user\homelab\HOMELAB-COMPLETE-SETUP.md")
+HOMELAB = pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md"  # optional; missing = skipped
 
 # Only inject the ~9k-token homelab doc when the question is actually about it,
 # instead of paying that on every hardware question (it overflowed num_ctx before).
-HOMELAB_TRIGGERS = ("docker", "container", "homelab", "compose", "traefik", "service",
-                    "service", "service", "service", "service", "grafana", "service",
-                    "k3s", "service", "vpn", "reverse proxy")
+# Generic infra terms; add your own service names locally if you want the gate to fire on them.
+HOMELAB_TRIGGERS = ("docker", "container", "homelab", "compose", "k3s", "kubernetes",
+                    "traefik", "grafana", "nginx", "vpn", "reverse proxy", "proxy")
 
 
 def _wants_homelab(message: str) -> bool:
