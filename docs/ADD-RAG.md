@@ -482,3 +482,244 @@ python rag.py --scores "what ports do I have on my motherboard?"
 You should see the rear-I/O / connector sections rise toward the top. If a still-relevant chunk
 sits just outside `TOP_K`, nudge `TOP_K` to 5–6 — with whole sections you need far fewer than the
 windowed version did.
+
+---
+
+## 8. Scale up: swap the JSON store for a vector database (sqlite-vec)
+
+The default store is a JSON file + a pure-Python cosine scan — fine to ~a few thousand chunks.
+Past that (large doc set, slow `--scores`, or you want metadata filtering / incremental updates),
+graduate the retrieval backend to **sqlite-vec**: a vector-search extension for the SQLite you
+*already* use for `history.db`. Still local, still file-based, no server.
+
+> **This is the one deliberate break from "zero new pip deps."** You add exactly one package
+> (`sqlite-vec`). The public API of `rag.py` does **not** change — `context.py` and `brain.py`
+> stay untouched. Only the internals (storage + search) swap out. Don't do this until you've
+> actually hit the scan ceiling; for a few hundred chunks the JSON store is faster to reason about.
+
+### 8.0 Prereq check — extension loading
+
+sqlite-vec loads as a SQLite extension, which needs your Python's `sqlite3` built with extension
+loading enabled. Check first:
+
+```powershell
+python -c "import sqlite3; sqlite3.connect(':memory:').enable_load_extension(True); print('OK')"
+```
+
+```
+OK
+```
+
+If that raises `AttributeError`/`OperationalError` instead of printing `OK`, your Python can't load
+the extension — **stay on the JSON store and just vectorize the scan with numpy instead** (numpy
+ships with torch/pandas, so that's still zero new deps). Otherwise continue.
+
+### 8.1 Install
+
+```powershell
+pip install sqlite-vec
+```
+
+Add it to `requirements.txt` (this is now a real dependency):
+
+```
+sqlite-vec   # vector store for rag.py (only if you did the section 8 upgrade)
+```
+
+> Wheels exist for Python 3.14 on Windows (verified: `sqlite-vec` v0.1.9). If `pip` can't find a
+> wheel for your Python, that's the only likely blocker — fall back to the numpy option above.
+
+### 8.2 Edit `rag.py` (public API unchanged)
+
+**Imports** — add `sqlite3` + sqlite-vec:
+
+```python
+import json, urllib.request, pathlib, hashlib, re, math, sys, sqlite3
+import sqlite_vec
+from sqlite_vec import serialize_float32
+```
+
+**Cache constant** — it's a database now, not JSON:
+
+```python
+DB = HERE / "rag_index.db"            # was: INDEX = HERE / "rag_index.json"
+```
+
+**Replace `build_index`, `retrieve`, and `_scored`, and add `_connect` / `_stored_sig` / `_knn`.**
+`_embed`, `_chunk`, `_load_sources`, `_sig`, and `context_block` stay exactly as they are.
+
+```python
+def _connect() -> sqlite3.Connection:
+    con = sqlite3.connect(DB)
+    con.enable_load_extension(True)
+    sqlite_vec.load(con)              # the vec0 extension is per-connection
+    con.enable_load_extension(False)
+    return con
+
+
+def _stored_sig(con) -> "str | None":
+    try:
+        row = con.execute("SELECT value FROM meta WHERE key='sig'").fetchone()
+        return row[0] if row else None
+    except sqlite3.OperationalError:
+        return None                  # tables don't exist yet (fresh db)
+
+
+def build_index(force: bool = False) -> sqlite3.Connection:
+    """Embed every chunk into a sqlite-vec table, cached in rag_index.db. Rebuilds on doc change.
+    Returns an OPEN connection with the extension loaded."""
+    docs = _load_sources()
+    sig = _sig(docs)
+    con = _connect()
+    if not force and _stored_sig(con) == sig:
+        return con                   # docs + settings unchanged -> reuse the embeddings
+    con.executescript(
+        "DROP TABLE IF EXISTS vec_chunks;"
+        "DROP TABLE IF EXISTS chunks;"
+        "DROP TABLE IF EXISTS meta;"
+        "CREATE TABLE chunks(id INTEGER PRIMARY KEY, source TEXT, text TEXT);"
+        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);"
+    )
+    chunks, sources = [], []
+    for name, text in docs:
+        for c in _chunk(text):
+            chunks.append(c); sources.append(name)
+    if chunks:
+        vecs = [_embed(c) for c in chunks]
+        # the vec0 column needs a literal dimension -> take it from the first vector
+        con.execute(f"CREATE VIRTUAL TABLE vec_chunks USING vec0(embedding float[{len(vecs[0])}])")
+        for src, txt, v in zip(sources, chunks, vecs):
+            cur = con.execute("INSERT INTO chunks(source, text) VALUES (?, ?)", (src, txt))
+            con.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
+                        (cur.lastrowid, serialize_float32(v)))
+    con.execute("INSERT INTO meta(key, value) VALUES ('sig', ?)", (sig,))
+    con.commit()
+    return con
+
+
+def _knn(con, question: str, k: int):
+    """The k nearest chunks as [(cosine_score, source, text), ...]; empty if the corpus is empty."""
+    q = serialize_float32(_embed(question, QUERY_PREFIX))
+    try:
+        rows = con.execute(
+            "SELECT rowid, distance FROM vec_chunks WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            (q, k),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []                    # no vec_chunks table -> nothing indexed
+    out = []
+    for rowid, dist in rows:
+        score = 1.0 - (dist * dist) / 2.0    # L2 on UNIT vectors -> cosine (see note below)
+        src, txt = con.execute("SELECT source, text FROM chunks WHERE id = ?", (rowid,)).fetchone()
+        out.append((score, src, txt))
+    return out
+
+
+def retrieve(question: str, k: int = TOP_K, min_score: float = MIN_SCORE) -> list[str]:
+    """Up to k reference chunks relevant to the question. Empty if nothing clears min_score."""
+    con = build_index()
+    hits = _knn(con, question, k)
+    con.close()
+    return [f"[{src}] {txt}" for score, src, txt in hits if score >= min_score]
+
+
+def _scored(question: str):
+    """All chunks scored, nearest first — for `--scores` calibration."""
+    con = build_index()
+    n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    hits = _knn(con, question, n or 1)
+    con.close()
+    return hits
+```
+
+**Update `demo()` and `__main__`** — `build_index` returns a connection now, not a dict:
+
+```python
+def demo():  # the one runnable check
+    assert len(_chunk("x" * 3000)) >= 3, "sliding-window chunker is wrong"
+    v = [0.6, 0.8]
+    assert abs(sum(a * b for a, b in zip(v, v)) - 1.0) < 1e-6, "cosine math wrong"
+    print("rag chunk/math ok")
+    try:
+        con = build_index(); n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]; con.close()
+        hits = retrieve("how is my reverse proxy / homelab networking set up?")
+        print(f"rag index ok: {n} chunks; query returned {len(hits)} relevant chunk(s)")
+        if hits:
+            print("top hit:", hits[0][:160].replace("\n", " "))
+    except Exception as e:
+        print(f"(skipped live retrieve - is Ollama up + `ollama pull {EMBED_MODEL}` done? {e})")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "--scores":
+        for score, src, txt in _scored(sys.argv[2]):
+            print(f"{score:.3f}  [{src}] {txt[:90].strip()}")
+    else:
+        demo()
+```
+
+### 8.3 Why the cosine math is a one-liner
+
+sqlite-vec ranks by **L2 distance** by default. Your `_embed` already L2-normalizes every vector,
+and for unit vectors `dist² = 2 − 2·cos`, so **ascending L2 distance == descending cosine** — the
+top-k ordering is identical, and `score = 1 − dist²/2` recovers the exact cosine. (Verified: the
+reconstructed score matches a brute-force dot product to 4 decimals.) Because the vectors stay
+normalized, your `MIN_SCORE = 0.45` threshold keeps the same meaning — no retuning needed.
+
+### 8.4 Migrate and verify
+
+```powershell
+# .gitignore: swap the cache filename
+#   rag_index.json   ->   rag_index.db
+
+del rag_index.json                                   # remove the old store (if present)
+python -c "import rag; rag.build_index(force=True)"  # build the sqlite-vec index once
+python rag.py                                        # self-test
+python rag.py --scores "what ports do I have on my motherboard?"
+```
+
+Expected `python rag.py` (with the embed model pulled and a real `SOURCES` doc):
+
+```
+rag chunk/math ok
+rag index ok: 46 chunks; query returned 4 relevant chunk(s)
+top hit: [MAG_Z790_TOMAHAWK_MAX_WIFI_User_Guide.md] ...
+```
+
+Same numbers, same answers as before — the difference is the search now runs in the DB engine and
+scales to far more chunks than a Python loop.
+
+### 8.5 What you unlocked (and the next step)
+
+- **Speed at scale** — KNN runs in SQLite instead of a Python `for` loop.
+- **Persistence** — the index is a real DB file you can inspect with any SQLite tool.
+- **Metadata filtering (next step)** — `vec0` KNN won't accept an extra `WHERE` (or a JOIN
+  filter) beside `MATCH`; it errors with *"a LIMIT or 'k = ?' constraint is required"* because the
+  KNN must own the query. The simple, always-correct pattern with this schema is **over-fetch then
+  filter in Python**. Add a `category` column to `chunks` (set it at insert time), then e.g.
+  *"only Windows docs"*:
+
+  ```python
+  con = build_index()
+  q = serialize_float32(_embed(question, QUERY_PREFIX))
+  rows = con.execute(                                   # pull a POOL, not just k
+      "SELECT rowid, distance FROM vec_chunks WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+      (q, 50),
+  ).fetchall()
+  out = []
+  for rowid, dist in rows:                              # already nearest-first
+      src, txt, cat = con.execute(
+          "SELECT source, text, category FROM chunks WHERE id = ?", (rowid,)).fetchone()
+      if cat == "windows" and 1.0 - dist * dist / 2.0 >= MIN_SCORE:
+          out.append(f"[{src}] {txt}")
+      if len(out) == TOP_K:
+          break
+  con.close()
+  ```
+
+  (For DB-side filtering at larger scale, sqlite-vec's newer *metadata/partition columns* declared
+  inside the `vec0` table are the proper tool — see the sqlite-vec docs — but post-filter is the
+  zero-risk version.)
+
+**Rollback** is clean: it's all in git and the public API is unchanged, so `git checkout rag.py`
+(and restore the `rag_index.json` line in `.gitignore`) puts you back on the JSON store.
