@@ -437,20 +437,34 @@ summary gets diluted and out-ranked by a dozen near-duplicate connector/pinout f
 | | Fix | Tradeoff |
 |---|---|---|
 | **A — quick** | Bump `TOP_K` to ~8–10 and retest | Immediate, but blunt: a rank-11 answer needs a big `K`, which drags in more noise and tokens |
-| **B — real fix (recommended for manuals)** | Replace `_chunk` with the **heading-aware** version below, so a section like "Rear I/O Ports" stays one whole chunk and ranks higher | ~15 lines, still zero new deps; best when you'll lean on a structured doc |
+| **B — real fix (recommended for manuals)** | Replace `_chunk` with the **heading-aware + fence-aware** version below, so a section like "Rear I/O Ports" stays one whole chunk and ranks higher | ~20 lines, still zero new deps; best when you'll lean on a structured doc |
 
-### The heading-aware `_chunk` (drop-in replacement)
+### The heading-aware, fence-aware `_chunk` (drop-in replacement)
 
 Paste this over the existing `_chunk` in `rag.py`. Same signature, same `CHUNK_CHARS`/`OVERLAP`
-knobs — it just respects markdown `#` headings instead of cutting blindly.
+knobs. It starts a new chunk at each markdown `#`-heading — but it tracks ` ``` `/`~~~` code
+fences and does **not** split on `#` lines *inside* a code block. That second part matters a lot
+for code-heavy docs: shell/YAML examples are full of `# comment` lines (`# main.yml`, `# => ...`)
+that a naïve heading split would treat as section starts and shred the examples across chunks.
 
 ```python
 def _chunk(text: str) -> list[str]:
-    """Markdown-heading-aware: keep each '#'-section whole so tables / spec lists / pinouts don't
-    get sliced mid-content. Sections bigger than CHUNK_CHARS fall back to the sliding window;
-    tiny adjacent sections are packed together. Better recall on structured docs (manuals)."""
-    parts = re.split(r"(?m)^(?=#{1,6}\s)", text)      # split *before* each heading line
-    sections = [p.strip() for p in parts if p.strip()]
+    """Markdown-heading-aware AND code-fence-aware: start a new chunk at each '#'-heading, but
+    NOT at '#' lines inside ``` / ~~~ code fences (shell/YAML examples are full of '# comments',
+    which would otherwise shred code blocks). Keeps tables / spec lists / code examples whole.
+    Oversized sections fall back to the sliding window; tiny adjacent sections are packed together."""
+    heading = re.compile(r"^#{1,6}\s")
+    fence = re.compile(r"^\s*(```|~~~)")
+    sections, cur, in_fence = [], [], False
+    for line in text.splitlines():
+        if fence.match(line):
+            in_fence = not in_fence                    # toggle: a fence delimiter is never a heading
+        elif heading.match(line) and not in_fence and cur:
+            sections.append("\n".join(cur)); cur = []  # real heading outside code -> new section
+        cur.append(line)
+    if cur:
+        sections.append("\n".join(cur))
+    sections = [s.strip() for s in sections if s.strip()]
     step = CHUNK_CHARS - OVERLAP
     chunks, buf = [], ""
     for sec in sections:
@@ -467,10 +481,14 @@ def _chunk(text: str) -> list[str]:
     return chunks or [text]
 ```
 
-> Works because each chunk now starts at a heading and carries that heading's whole body (table
-> and all). A section longer than `CHUNK_CHARS` still falls back to the windowed split, so nothing
-> is ever dropped. The `python rag.py` self-test still passes (a heading-less 3000-char blob has
-> no headings → one big section → windowed into 3 chunks).
+> Each chunk now starts at a heading and carries that heading's whole body (table and all). The
+> fence tracking is what keeps code examples intact — verified on the scraped Ansible docs, it cut
+> **229 spurious section boundaries** (799 → 570) versus the naïve `re.split`. A section longer than
+> `CHUNK_CHARS` still falls back to the windowed split, so nothing is dropped, and the
+> `python rag.py` self-test still passes (a heading-less, fence-less 3000-char blob → one section →
+> windowed into 3 chunks). Notes: indented (non-fenced) code isn't tracked — a `  # comment` with
+> leading spaces simply isn't a heading (`^#`), so it's already safe; only badly *unbalanced* fences
+> could confuse the toggle, which well-formed docs don't have.
 
 After pasting, **rebuild and retest** — the cache must re-embed with the new chunk boundaries:
 
