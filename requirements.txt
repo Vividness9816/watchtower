@@ -1,0 +1,9 @@
+# Watch Tower — Python pip dependencies (the only 3 non-stdlib imports in the project).
+# Install torch from the CUDA index that matches your driver (see the recreate guide).
+# Everything else the app uses (json, sqlite3, subprocess, urllib, shutil, ...) is stdlib.
+torch
+gradio
+pandas
+
+# Linux ONLY — the Linux collectors use psutil instead of PowerShell/CIM. Uncomment on Linux:
+# psutil
