@@ -1529,6 +1529,57 @@ python brain.py
 ```
 Expected: `brain ok: <a real sentence about your machine's current state>`
 
+### Choosing the chat model — US-built open-weight options
+
+`brain.py` sets `MODEL = "qwen2.5:32b"` — a strong default, but Qwen is built by Alibaba (China).
+To run a **US-built** model instead, `ollama pull <tag>` one of the open-weight families below, then
+set `MODEL` to that tag and re-check `num_ctx` against your VRAM. They all run the same way through
+Ollama; no other code changes.
+
+> VRAM figures are **approximate**, at Ollama's default **Q4_K_M** quant, and cover the *weights
+> only* — add KV cache for your `num_ctx` (~256 KB/token for a 32B; less for smaller models). If a
+> model doesn't fit VRAM, Ollama spills layers to system RAM: slower, but it still runs. Tags and
+> context lengths change over time — confirm with `ollama show <tag>` and the model card.
+
+| Model (US company) | `ollama pull` tag | Params | Context | ~VRAM @ Q4 | Notes |
+|---|---|---|---|---|---|
+| Llama 3.2 (Meta) | `llama3.2:1b` · `:3b` | 1B · 3B | 128K | ~1 · ~2.5 GB | edge / CPU-friendly |
+| Llama 3.1 (Meta) | `llama3.1:8b` | 8B | 128K | ~6 GB | best small all-rounder |
+| Llama 3.3 (Meta) | `llama3.3:70b` | 70B | 128K | ~42 GB | ~405B quality at 70B |
+| Llama 3.1 (Meta) | `llama3.1:70b` · `:405b` | 70B · 405B | 128K | ~42 · ~230 GB | 405B = multi-GPU / server |
+| Llama 4 Scout (Meta) | `llama4:scout` | 109B MoE / 17B active | up to 10M | ~65 GB | MoE; very long context |
+| Llama 4 Maverick (Meta) | `llama4:maverick` | 400B MoE / 17B active | 1M | ~240 GB | server / multi-GPU |
+| Gemma 3 (Google) | `gemma3:1b·4b·12b·27b` | 1–27B | 128K (1B: 32K) | ~1 · ~3 · ~8 · ~17 GB | vision on 4B+; excellent |
+| Gemma 2 (Google) | `gemma2:2b·9b·27b` | 2–27B | 8K | ~2 · ~6 · ~16 GB | older, short context |
+| Phi-4 (Microsoft) | `phi4` | 14B | 16K | ~9 GB | strong reasoning per GB |
+| Phi-4-mini (Microsoft) | `phi4-mini` | 3.8B | 128K | ~3 GB | small + long context |
+| gpt-oss (OpenAI) | `gpt-oss:20b` · `:120b` | 21B · 117B MoE | 128K | ~14 · ~65 GB | OpenAI's open-weight reasoning models (MXFP4) |
+| Nemotron (NVIDIA) | `nemotron:70b` | 70B | 128K | ~42 GB | NVIDIA-tuned Llama-3.1, RLHF |
+| Nemotron-mini (NVIDIA) | `nemotron-mini:4b` | 4B | 4K | ~3 GB | on-device |
+| Granite 3.3 (IBM) | `granite3.3:2b` · `:8b` | 2B · 8B | 128K | ~2 · ~5 GB | enterprise, tool-use |
+| OLMo 2 (Allen AI) | `olmo2:7b` · `:13b` | 7B · 13B | 4K | ~5 · ~8 GB | fully open (data + weights) |
+| DBRX (Databricks) | `dbrx` | 132B MoE / 36B active | 32K | ~80 GB | server-class MoE |
+
+> **Not open-weight (can't `ollama pull`):** Anthropic Claude and OpenAI's flagship GPT are
+> API-only — OpenAI's open release is **gpt-oss** (above). xAI published Grok-1 weights, but at 314B
+> they're impractical here. Mistral/Mixtral (France), Qwen/DeepSeek (China), Command-R (Cohere,
+> Canada) and Falcon (UAE) are excluded as non-US.
+
+**Pick by capability:**
+
+- **If hardware is no object** (≥48 GB VRAM, or multi-GPU / server): `llama3.1:405b` or
+  `llama4:maverick` for frontier quality; **`llama3.3:70b`** or **`nemotron:70b`** as the best
+  practical 70B; **`gpt-oss:120b`** for OpenAI-style reasoning; `dbrx` for a fast MoE. On a single
+  ~32 GB GPU the strongest US options are **`gpt-oss:20b`**, **`gemma3:27b`**, or **`phi4`**.
+- **If hardware is constrained** (8–16 GB VRAM, or CPU-only): **`llama3.1:8b`** or
+  **`granite3.3:8b`** (8 GB class); **`gemma3:12b`** / **`phi4`** at ~12 GB; **`llama3.2:3b`** /
+  **`gemma3:4b`** / **`phi4-mini`** for CPU-only or ≤8 GB. Keep `num_ctx` at `8192`–`16384` so the
+  KV cache fits beside the weights.
+
+Sizing rule: **weights (≈ the table's VRAM) + KV cache (`num_ctx`) ≤ your VRAM**, else lower
+`num_ctx` in `brain.py` or accept CPU spillover. After pulling, set `MODEL = "<tag>"` and restart
+`app.py` / `chat.py`.
+
 ---
 
 ## 8. Run it
@@ -1587,12 +1638,12 @@ sysdiag/
 ├─ .gitignore  requirements.txt
 ├─ schema.py rules.py data.py gpt.py train.py infer.py   # tiny GPT (identical to Windows)
 ├─ sysdiag.py history.py                                 # truth layer + logger
-├─ context.py brain.py                                   # Ollama chat brain (Linux-tuned prompt/path)
+├─ context.py brain.py rag.py                            # Ollama chat brain + RAG (Linux-tuned prompt/path)
 ├─ art.py trends.py app.py chat.py                       # UI/CLI (identical to Windows)
 ├─ system_facts.md
 ├─ collectors/
 │   └─ cpu.py mem.py disk.py gpu.py sensors.py net.py whea.py docker.py k3s.py usb.py storage.py
-├─ corpus.txt   vocab.json   ckpt.pt   history.db        # generated (last three git-ignored)
+├─ corpus.txt   vocab.json   ckpt.pt   history.db   rag_index.db   # generated (ckpt/history/rag_index git-ignored)
 ```
 
 ## 12. Troubleshooting
@@ -1600,10 +1651,541 @@ sysdiag/
 | Symptom | Cause | Fix |
 |---|---|---|
 | `(Ollama returned HTTP 400: cannot unmarshal array … into string)` | Gradio sent list-shaped content | `_text()` in `brain.py` — already included |
-| Chat replies **one word** then stops | prompt filled `num_ctx`, no room to generate | keep the homelab doc gated; keep `num_ctx` ≥ prompt + reply |
+| Chat replies **one word** then stops | prompt filled `num_ctx`, no room to generate | keep retrieval lean (lower `TOP_K` / raise `MIN_SCORE` in `rag.py`); keep `num_ctx` ≥ prompt + reply |
 | `(couldn't reach Ollama …)` | service down / model not pulled | `systemctl status ollama`, `ollama pull qwen2.5:32b` |
 | `sensors: cpu_temp null` | lm-sensors not configured | `sudo sensors-detect --auto`; adjust chip names in `sensors.py` |
 | `whea` always 0 | `journalctl -k` needs perms, or genuinely no MCEs | add user to `systemd-journal` group (0 is the healthy case) |
 | `cuda False` | torch CPU build / driver | install the CUDA `torch` wheel matching `nvidia-smi` |
 | `docker not found` / k3s error | not installed or no perms | optional collectors — ignore, or add user to `docker` group / allow passwordless `k3s kubectl` |
 | Edited a file, app unchanged | Gradio cached the module | restart `app.py` |
+
+---
+
+## 13. Add a local RAG pipeline (semantic doc retrieval)
+
+Everything above gives the chat brain a *live* picture of the machine (snapshot + findings) plus a
+single static `system_facts.md`. **RAG** adds a *reference library*: point it at any Markdown docs —
+homelab notes, hardware manuals, scraped wikis (PowerShell/Arch/Linux), runbooks — and the model
+gets only the few paragraphs actually relevant to each question, pulled by semantic similarity,
+instead of being fed (or not fed) a whole document by a keyword gate.
+
+It stays true to the rest of Watch Tower: **local-only, read-only** (it only SELECTS text to show
+the model), and degrades to silence if Ollama is down. It adds **one file** (`rag.py`), edits
+**one** (`context.py`), and `brain.py` does **not** change. Run every command from the project
+root (`sysdiag/`), where `rag.py` lives.
+
+> Built to scale: this version embeds in **batches** and indexes **incrementally**, so a large
+> corpus (tens of thousands of chunks) builds in minutes and editing one doc re-embeds only that
+> doc. The mechanics are in **§13.6**.
+
+### 13.1 Pull an embedding model
+
+Retrieval needs a real *embedding* model (chat models like `qwen2.5:32b` return an empty vector
+from the embeddings endpoint — they have no embedding head). The default is `nomic-embed-text`:
+
+```bash
+ollama pull nomic-embed-text
+```
+Expected (~274 MB, runs fine on CPU — no VRAM needed):
+```
+pulling manifest
+pulling ... 100% ▕████████████████▏ 274 MB
+verifying sha256 digest
+success
+```
+
+US-built embedding models you can use instead (set `EMBED_MODEL` in `rag.py`):
+
+| Embedder (US company) | `ollama pull` tag | Dim | Context | Size | Notes |
+|---|---|---|---|---|---|
+| nomic-embed-text (Nomic AI) | `nomic-embed-text` | 768 | 8192 | 274 MB | **default**; wants the `search_document:` / `search_query:` prefixes (already in `rag.py`) |
+| snowflake-arctic-embed (Snowflake) | `snowflake-arctic-embed` · `:137m` · `:33m` | 1024 / 768 | 512 | 70–670 MB | strong English retrieval |
+| snowflake-arctic-embed2 (Snowflake) | `snowflake-arctic-embed2` | 1024 | 8192 | 1.2 GB | multilingual + long context |
+| granite-embedding (IBM) | `granite-embedding:30m` · `:278m` | 384 / 768 | 512 | 60 / 560 MB | enterprise |
+
+> Non-US embedders you'll see in Ollama: `all-minilm` (sentence-transformers, Germany),
+> `mxbai-embed-large` (Mixedbread, Germany) and `bge-*` (BAAI, China) — fine technically,
+> excluded here as non-US. If you switch embedder, set
+> `EMBED_MODEL`, adjust `DOC_PREFIX`/`QUERY_PREFIX` per its model card, and rebuild with
+> `python rag.py --build --force`.
+
+### 13.2 The vector store (sqlite-vec)
+
+`rag.py` stores embeddings in **sqlite-vec** — a vector-search extension for the same SQLite you
+already use for `history.db`. It's already in `requirements.txt`:
+
+```bash
+pip install sqlite-vec
+```
+sqlite-vec loads as a SQLite extension, which needs your Python's `sqlite3` built with extension
+loading enabled. Confirm:
+```bash
+python -c "import sqlite3; sqlite3.connect(':memory:').enable_load_extension(True); print('OK')"
+```
+Expected: `OK`. (Most distro and python.org builds support it. A minimal/static build that raises
+here would need `sqlite3` rebuilt with extension loading enabled.)
+
+### 13.3 Create `rag.py`
+
+Paste this into the project root. It is self-contained and self-tests with `python rag.py`. (The
+listing is wrapped in a four-backtick fence because the code itself contains triple-backticks.)
+
+````python
+# rag.py — local RAG for Watch Tower. Makes your reference docs (homelab notes, hardware manuals,
+# runbooks, scraped wikis) searchable so the chat model can quote the RIGHT few paragraphs instead
+# of being fed a whole document. Embeddings come from Ollama's local embedding model; retrieval is
+# a cosine KNN over a sqlite-vec vector store. READ-ONLY: it only SELECTS text to show the model.
+#
+# Scales to a LARGE corpus (tens of thousands of chunks) via two things:
+#   * BATCH embedding   — many chunks per Ollama /api/embed call (falls back to /api/embeddings on
+#                         older Ollama). Turns an hours-long sequential build into minutes.
+#   * INCREMENTAL index — each source's content hash is stored; only NEW or CHANGED docs are
+#                         re-embedded, and docs removed from SOURCES are dropped. Editing one small
+#                         doc costs seconds, not a full re-embed of the whole corpus.
+#
+# Deps: Ollama (already required) + `ollama pull nomic-embed-text` + `pip install sqlite-vec`.
+# Everything else (json/urllib/pathlib/hashlib/re/math/sqlite3) is stdlib.
+#
+# Build the index (do this once after adding docs; re-run anytime — it only does the delta):
+#   python rag.py --build           # embed new/changed docs
+#   python rag.py --build --force    # wipe + re-embed everything (after changing a tuning knob)
+
+import json, urllib.request, urllib.error, pathlib, hashlib, re, math, sys, sqlite3
+import sqlite_vec
+from sqlite_vec import serialize_float32
+
+OLLAMA_HOST  = "http://127.0.0.1:11434"
+OLLAMA_EMBED = OLLAMA_HOST + "/api/embed"        # batch endpoint (newer Ollama): {"input": [...]}
+OLLAMA_EMB1  = OLLAMA_HOST + "/api/embeddings"   # single endpoint (older Ollama): {"prompt": "..."}
+EMBED_MODEL  = "nomic-embed-text"                # `ollama pull nomic-embed-text` (~270 MB, CPU-ok)
+EMBED_BATCH  = 64                                # chunks sent per /api/embed request
+HERE = pathlib.Path(__file__).parent
+DB   = HERE / "rag_index.db"                     # generated cache — git-ignored
+
+# Docs to make searchable: EVERY *.md in this folder, plus the homelab notes (if present). Missing
+# files are skipped. Drop a new .md in here and the next `python rag.py --build` picks it up.
+SOURCES = [pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md", *sorted(HERE.glob("*.md"))]
+
+# --- tuning knobs (the RAG equivalent of rules.THRESH — tune for YOUR docs) ---
+CHUNK_CHARS = 1200    # size of each searchable slice (~300 tokens)
+OVERLAP     = 200     # chars repeated between neighbours so a fact on a boundary isn't lost
+TOP_K       = 4       # how many chunks to return per question
+MIN_SCORE   = 0.45    # cosine floor; below this a chunk is "not really relevant" and is dropped
+                      #   -> an off-topic question retrieves nothing. THIS is the knob to tune.
+
+# nomic-embed-text wants these task prefixes; they materially improve retrieval. Other embedders
+# differ: mxbai-embed-large wants only a query-side instruction and no document prefix. If unsure
+# for your model, set both to "" — it works, just slightly weaker on the query side.
+DOC_PREFIX   = "search_document: "
+QUERY_PREFIX = "search_query: "
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)        # build progress -> stderr, never pollutes stdout
+
+
+def _norm(v: list[float]) -> list[float]:
+    """L2-normalize so cosine == dot product (lets sqlite-vec's L2 distance recover cosine)."""
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+
+def _embed(text: str, prefix: str = DOC_PREFIX) -> list[float]:
+    """One text -> one normalized vector via the single-item endpoint (the fallback path)."""
+    body = json.dumps({"model": EMBED_MODEL, "prompt": prefix + text}).encode()
+    req = urllib.request.Request(OLLAMA_EMB1, data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return _norm(json.loads(r.read())["embedding"])
+
+
+def _embed_batch(texts: list[str], prefix: str = DOC_PREFIX) -> list[list[float]]:
+    """Many texts -> many normalized vectors in ONE /api/embed call. Falls back to the older
+    one-at-a-time /api/embeddings endpoint if this Ollama is too old to have /api/embed (HTTP 404)."""
+    body = json.dumps({"model": EMBED_MODEL, "input": [prefix + t for t in texts]}).encode()
+    req = urllib.request.Request(OLLAMA_EMBED, data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return [_norm(v) for v in json.loads(r.read())["embeddings"]]
+    except urllib.error.HTTPError as e:
+        if e.code == 404:                          # old Ollama without /api/embed -> single calls
+            return [_embed(t, prefix) for t in texts]
+        raise
+
+
+def _embed_all(texts: list[str], prefix: str = DOC_PREFIX) -> list[list[float]]:
+    """Embed a whole doc's chunks in EMBED_BATCH-sized requests."""
+    out = []
+    for i in range(0, len(texts), EMBED_BATCH):
+        out.extend(_embed_batch(texts[i:i + EMBED_BATCH], prefix))
+    return out
+
+
+def _chunk(text: str) -> list[str]:
+    """Markdown-heading-aware AND code-fence-aware: start a new chunk at each '#'-heading, but
+    NOT at '#' lines inside ``` / ~~~ code fences (shell/YAML examples are full of '# comments',
+    which would otherwise shred code blocks). Keeps tables / spec lists / code examples whole.
+    Oversized sections fall back to the sliding window; tiny adjacent sections are packed together."""
+    heading = re.compile(r"^#{1,6}\s")
+    fence = re.compile(r"^\s*(```|~~~)")
+    sections, cur, in_fence = [], [], False
+    for line in text.splitlines():
+        if fence.match(line):
+            in_fence = not in_fence                    # toggle: a fence delimiter is never a heading
+        elif heading.match(line) and not in_fence and cur:
+            sections.append("\n".join(cur)); cur = []  # real heading outside code -> new section
+        cur.append(line)
+    if cur:
+        sections.append("\n".join(cur))
+    sections = [s.strip() for s in sections if s.strip()]
+    step = CHUNK_CHARS - OVERLAP
+    chunks, buf = [], ""
+    for sec in sections:
+        if len(sec) > CHUNK_CHARS:                    # oversized section -> window it
+            if buf:
+                chunks.append(buf); buf = ""
+            chunks += [sec[i:i + CHUNK_CHARS] for i in range(0, len(sec), step)]
+        elif len(buf) + len(sec) + 2 <= CHUNK_CHARS:  # pack small sections together
+            buf = f"{buf}\n\n{sec}" if buf else sec
+        else:                                         # buf full -> flush, start a new one
+            chunks.append(buf); buf = sec
+    if buf:
+        chunks.append(buf)
+    return chunks or [text]
+
+
+def _load_sources() -> list[tuple[str, str, str]]:
+    """[(name, text, sha256), ...] de-duplicated by resolved path; missing files skipped."""
+    docs, seen = [], set()
+    for p in SOURCES:
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        if rp in seen:
+            continue
+        seen.add(rp)
+        try:
+            t = p.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue                          # missing file: skip, exactly like context.py
+        if t:
+            sha = hashlib.sha256(t.encode("utf-8", "replace")).hexdigest()
+            docs.append((p.name, t, sha))
+    return docs
+
+
+def _connect() -> sqlite3.Connection:
+    con = sqlite3.connect(DB)
+    con.enable_load_extension(True)
+    sqlite_vec.load(con)              # the vec0 extension is per-connection
+    con.enable_load_extension(False)
+    return con
+
+
+def _ensure_schema(con) -> None:
+    con.executescript(
+        "CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, source TEXT, text TEXT);"
+        "CREATE TABLE IF NOT EXISTS sources(name TEXT PRIMARY KEY, sha TEXT);"
+        "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);"
+    )
+
+
+def _meta_get(con, key: str) -> "str | None":
+    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _meta_set(con, key: str, value: str) -> None:
+    con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, value))
+
+
+def _ensure_vec_table(con, dim: int) -> None:
+    """Create the vec0 table on first use; its dimension is fixed at creation, recorded in meta."""
+    if _meta_get(con, "dim") is None:
+        con.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(embedding float[{dim}])")
+        _meta_set(con, "dim", str(dim))
+
+
+def _delete_source(con, name: str) -> None:
+    """Drop a doc's chunks + vectors (vec table may not exist yet on a first build)."""
+    try:
+        con.execute("DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE source=?)",
+                    (name,))
+    except sqlite3.OperationalError:
+        pass                              # vec_chunks not created yet
+    con.execute("DELETE FROM chunks WHERE source=?", (name,))
+    con.execute("DELETE FROM sources WHERE name=?", (name,))
+
+
+def build_index(force: bool = False) -> sqlite3.Connection:
+    """Embed every NEW or CHANGED source into a sqlite-vec table, cached in rag_index.db. Only the
+    delta is re-embedded (per-source content hash); removed docs are dropped. Returns an OPEN
+    connection with the extension loaded. `force=True` wipes and re-embeds the whole corpus."""
+    docs = _load_sources()
+    con = _connect()
+    _ensure_schema(con)
+    settings = f"{CHUNK_CHARS}|{OVERLAP}|{EMBED_MODEL}|{DOC_PREFIX}|{QUERY_PREFIX}"
+    if force or _meta_get(con, "settings") != settings:
+        # a settings change invalidates every stored embedding -> wipe and full rebuild
+        con.executescript("DROP TABLE IF EXISTS vec_chunks;"
+                           "DELETE FROM chunks; DELETE FROM sources; DELETE FROM meta;")
+        _ensure_schema(con)
+        _meta_set(con, "settings", settings)
+    have = dict(con.execute("SELECT name, sha FROM sources").fetchall())
+    current = {name: (text, sha) for name, text, sha in docs}
+    for name in set(have) - set(current):          # docs removed from SOURCES
+        _delete_source(con, name); _log(f"  [removed] {name}")
+    todo = [(n, t, s) for n, (t, s) in current.items() if have.get(n) != s]
+    if not todo:
+        con.commit()
+        return con                                 # nothing new/changed -> reuse the embeddings
+    _log(f"indexing {len(todo)} new/changed doc(s) of {len(current)} (batch={EMBED_BATCH})...")
+    for name, text, sha in todo:
+        _delete_source(con, name)                  # clear stale rows if the doc changed
+        chunks = _chunk(text)
+        if not chunks:
+            continue
+        vecs = _embed_all(chunks)
+        _ensure_vec_table(con, len(vecs[0]))
+        for txt, v in zip(chunks, vecs):
+            cur = con.execute("INSERT INTO chunks(source, text) VALUES(?, ?)", (name, txt))
+            con.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES(?, ?)",
+                        (cur.lastrowid, serialize_float32(v)))
+        con.execute("INSERT OR REPLACE INTO sources(name, sha) VALUES(?, ?)", (name, sha))
+        con.commit()                               # commit per doc -> safe to interrupt and resume
+        _log(f"  [indexed] {name}: {len(chunks)} chunks")
+    return con
+
+
+def _knn(con, question: str, k: int):
+    """The k nearest chunks as [(cosine_score, source, text), ...]; empty if the corpus is empty."""
+    q = serialize_float32(_embed(question, QUERY_PREFIX))
+    try:
+        rows = con.execute(
+            "SELECT rowid, distance FROM vec_chunks WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+            (q, k),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []                    # no vec_chunks table -> nothing indexed
+    out = []
+    for rowid, dist in rows:
+        score = 1.0 - (dist * dist) / 2.0    # L2 on UNIT vectors -> cosine (vectors are normalized)
+        src, txt = con.execute("SELECT source, text FROM chunks WHERE id = ?", (rowid,)).fetchone()
+        out.append((score, src, txt))
+    return out
+
+
+def retrieve(question: str, k: int = TOP_K, min_score: float = MIN_SCORE) -> list[str]:
+    """Up to k reference chunks relevant to the question. Empty if nothing clears min_score."""
+    con = build_index()
+    hits = _knn(con, question, k)
+    con.close()
+    return [f"[{src}] {txt}" for score, src, txt in hits if score >= min_score]
+
+
+def context_block(question: str) -> str:
+    """Ready-to-inject grounding text for context.build(); '' when nothing is relevant.
+    NEVER raises: if Ollama is down or the embed model isn't pulled, retrieval degrades to ''
+    so the chat keeps working (static facts + live snapshot + findings still ground the answer).
+    This is what lets context.build() — called OUTSIDE brain.ask's try/except — stay crash-proof."""
+    try:
+        hits = retrieve(question)
+    except Exception:
+        return ""                              # Ollama unavailable / model not pulled -> no docs
+    if not hits:
+        return ""
+    return ("REFERENCE DOCS (retrieved as most relevant to this question — quote these):\n\n"
+            + "\n\n---\n\n".join(hits))
+
+
+def _scored(question: str):
+    """All chunks scored, nearest first — for `--scores` calibration."""
+    con = build_index()
+    n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]
+    hits = _knn(con, question, n or 1)
+    con.close()
+    return hits
+
+
+def demo():  # the one runnable check
+    assert len(_chunk("x" * 3000)) >= 3, "sliding-window chunker is wrong"
+    v = [0.6, 0.8]                             # a unit vector's cosine with itself must be 1
+    assert abs(sum(a * b for a, b in zip(v, v)) - 1.0) < 1e-6, "cosine math wrong"
+    print("rag chunk/math ok")
+    if not DB.exists():                        # honor "build later": don't kick off a full build here
+        print(f"(index not built yet — run `python rag.py --build` to embed {len(_load_sources())} docs)")
+        return
+    try:
+        con = _connect(); n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]; con.close()
+        if not n:
+            print("(index is empty — run `python rag.py --build`)"); return
+        hits = retrieve("how is my reverse proxy / homelab networking set up?")
+        print(f"rag index ok: {n} chunks; query returned {len(hits)} relevant chunk(s)")
+        if hits:
+            print("top hit:", hits[0][:160].replace("\n", " "))
+    except Exception as e:
+        print(f"(skipped live retrieve - is Ollama up + `ollama pull {EMBED_MODEL}` done? {e})")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--build":
+        con = build_index(force="--force" in sys.argv)
+        n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]; con.close()
+        print(f"index built: {n} chunks from {len(_load_sources())} doc(s)")
+    elif len(sys.argv) > 2 and sys.argv[1] == "--scores":
+        for score, src, txt in _scored(sys.argv[2]):
+            print(f"{score:.3f}  [{src}] {txt[:90].strip()}")
+    else:
+        demo()
+````
+
+Drop any `.md` you want searchable into the project folder — `SOURCES` globs every `*.md` in it
+automatically, plus your homelab notes. Offline self-test (no Ollama needed for the asserts):
+
+```bash
+python rag.py
+```
+Expected before you've built the index:
+```
+rag chunk/math ok
+(index not built yet — run `python rag.py --build` to embed 20 docs)
+```
+
+### 13.4 Wire it into `context.py`
+
+`context.build(message)` already produces the `{ctx}` string in `brain.SYSTEM`. RAG replaces the
+old keyword gate (`_wants_homelab` / whole-doc dump) with semantic retrieval.
+
+**13.4a** — add the import at the top of `context.py`:
+```python
+import json, pathlib
+import rules
+import rag                      # NEW
+```
+**13.4b** — append retrieved chunks at the end of `build()`:
+```python
+def build(message: str = "") -> str:
+    snap, findings = snapshot_and_findings()
+    parts = [
+        "STATIC FACTS ABOUT THIS MACHINE:",
+        _read(FACTS) or "(no system_facts.md)",
+        "",
+        "LIVE SNAPSHOT (JSON, just collected):",
+        json.dumps(snap, indent=2),
+        "",
+        "FINDINGS (deterministic ground truth from rules.py — trust these over guesses):",
+        json.dumps(findings, indent=2) if findings else "none — all nominal",
+    ]
+    refs = rag.context_block(message)      # semantic retrieval replaces the keyword gate
+    if refs:
+        parts += ["", refs]
+    return "\n".join(parts)
+```
+**13.4c** — delete the now-dead keyword gate (`HOMELAB`, `HOMELAB_TRIGGERS`, `_wants_homelab`) and
+move that doc path into `rag.SOURCES` (it's already covered by the `*.md` glob if the doc lives in
+the project folder). Update the `__main__` self-test:
+```python
+if __name__ == "__main__":
+    out = build("how is my reverse proxy set up?")
+    assert "FINDINGS" in out, "context block lost its findings"
+    print(out[:800])
+```
+`brain.py` is unchanged — it calls `context.build(user_text)` and passes the whole grounded string
+as the system prompt.
+
+### 13.5 Build the index
+
+From the project root (`sysdiag/`), with Ollama running and `nomic-embed-text` pulled:
+
+```bash
+python rag.py --build
+```
+Expected (counts depend on your docs; the big scraped corpora dominate):
+```
+indexing 20 new/changed doc(s) of 20 (batch=64)...
+  [indexed] HOMELAB-COMPLETE-SETUP.md: 37 chunks
+  [indexed] Docker-Troubleshooting.md: 290 chunks
+  [indexed] arch-wiki-merged.md: 21044 chunks
+  [indexed] powershell-docs-merged.md: 28850 chunks
+  ...
+index built: 54213 chunks from 20 doc(s)
+```
+- It commits **per document**, so a long first build is safe to Ctrl+C and resume — re-running
+  `--build` continues where it left off.
+- A multi-MB corpus (e.g. the merged PowerShell/Arch/Linux wikis) is **tens of thousands of
+  chunks**. On a GPU that Ollama can use for the embedder, that's minutes; on CPU, longer (let it
+  run). After the first build it's instant unless a doc changes.
+- Re-run `python rag.py --build` after editing or adding any doc — only the changed/new docs
+  re-embed (see §13.6). Use `--build --force` only after changing `CHUNK_CHARS`/`OVERLAP`/the
+  embedder, which invalidates every stored vector.
+
+### 13.6 How it scales to a large corpus (batch + incremental)
+
+Two design choices make a 60 MB+ corpus practical:
+
+1. **Batch embedding.** `_embed_all` posts up to `EMBED_BATCH` (64) chunks per `/api/embed` call
+   instead of one HTTP round-trip per chunk. On a large corpus that's the difference between
+   minutes and hours. If your Ollama predates `/api/embed`, `_embed_batch` catches the 404 and
+   transparently falls back to the one-at-a-time `/api/embeddings` endpoint.
+
+2. **Incremental indexing.** Each source's SHA-256 is stored in a `sources` table. On every build,
+   `rag.py` compares hashes and re-embeds **only** new or changed docs; docs you removed from
+   `SOURCES` are deleted from the index. So editing one small note re-embeds seconds of work, not
+   the whole corpus — and the per-document commit makes the build resumable.
+
+The store is **sqlite-vec**, whose KNN runs in the DB engine, so ~50k+ vectors stay fast. Retrieval
+always returns just `TOP_K` chunks, so corpus size never bloats the chat context — a bigger library
+only improves recall. (Both behaviors are covered by the `python rag.py` self-tests and a small
+incremental-logic check.)
+
+### 13.7 Verify end to end
+
+```bash
+python context.py
+```
+A homelab/manual-style question pulls a `REFERENCE DOCS (...)` section into the printed block; a
+pure-hardware question (e.g. "is my GPU hot?") won't.
+
+Calibrate the relevance floor — `--scores` prints every chunk's cosine so you can pick `MIN_SCORE`:
+```bash
+python rag.py --scores "what ports do I have on my motherboard?"
+```
+```
+0.71  [MAG_Z790_TOMAHAWK_MAX_WIFI_User_Guide.md] ## Rear I/O ...
+0.68  [MAG_Z790_TOMAHAWK_MAX_WIFI_User_Guide.md] ### USB connectors ...
+0.39  [Docker-Troubleshooting.md] ## Networking ...
+```
+Then use the chat as normal — it cites the retrieved text instead of guessing:
+```bash
+python chat.py        # or: python app.py
+```
+
+### 13.8 Tuning & maintenance
+
+| Knob (in `rag.py`) | Default | Change it when |
+|---|---|---|
+| `SOURCES` | every `*.md` in the folder + homelab doc | it's a glob — just drop a `.md` in the folder |
+| `MIN_SCORE` | `0.45` | **the main dial.** Higher = stricter (less noise); lower = looser (more recall) |
+| `TOP_K` | `4` | answers need more context; watch you don't blow `num_ctx` in `brain.py` |
+| `CHUNK_CHARS` / `OVERLAP` | `1200` / `200` | smaller = finer retrieval; bigger = more context per hit |
+| `EMBED_MODEL` | `nomic-embed-text` | switching embedder (adjust the prefixes; `--build --force`) |
+| `EMBED_BATCH` | `64` | lower if Ollama OOMs on a batch; higher to squeeze a fast GPU |
+
+Git-ignore the cache (already in this project's `.gitignore`):
+```
+rag_index.db
+```
+
+### 13.9 Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `HTTP Error 404` on embed | embed model not pulled — `ollama pull nomic-embed-text`; check `ollama list` |
+| retrieval always empty | you pointed `EMBED_MODEL` at a **chat** model (empty vectors). Use a real embedder |
+| nothing retrieved for a relevant question | `MIN_SCORE` too high, or the doc isn't in the folder. Use `python rag.py --scores "..."` |
+| off-topic questions still pull chunks | `MIN_SCORE` too low — raise it |
+| first build is slow | expected on a big corpus; it batches + commits per doc, so it's resumable |
+| edited a doc, answer unchanged | rebuild: `python rag.py --build` (only that doc re-embeds) |
+| `OperationalError` on `enable_load_extension` | your Python can't load SQLite extensions — rebuild `sqlite3` with them enabled |

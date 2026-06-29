@@ -1,25 +1,37 @@
-# rag.py — tiny local RAG for Watch Tower. Makes your reference docs (homelab notes, manuals,
-# runbooks) searchable so the chat model can quote the RIGHT few paragraphs instead of being fed
-# a whole document. Embeddings come from Ollama's local embedding model; retrieval is a cosine
-# KNN over a sqlite-vec vector store. READ-ONLY: it only SELECTS text to show the model.
+# rag.py — local RAG for Watch Tower. Makes your reference docs (homelab notes, hardware manuals,
+# runbooks, scraped wikis) searchable so the chat model can quote the RIGHT few paragraphs instead
+# of being fed a whole document. Embeddings come from Ollama's local embedding model; retrieval is
+# a cosine KNN over a sqlite-vec vector store. READ-ONLY: it only SELECTS text to show the model.
+#
+# Scales to a LARGE corpus (tens of thousands of chunks) via two things:
+#   * BATCH embedding   — many chunks per Ollama /api/embed call (falls back to /api/embeddings on
+#                         older Ollama). Turns an hours-long sequential build into minutes.
+#   * INCREMENTAL index — each source's content hash is stored; only NEW or CHANGED docs are
+#                         re-embedded, and docs removed from SOURCES are dropped. Editing one small
+#                         doc costs seconds, not a full re-embed of the whole corpus.
 #
 # Deps: Ollama (already required) + `ollama pull nomic-embed-text` + `pip install sqlite-vec`.
 # Everything else (json/urllib/pathlib/hashlib/re/math/sqlite3) is stdlib.
+#
+# Build the index (do this once after adding docs; re-run anytime — it only does the delta):
+#   python rag.py --build           # embed new/changed docs
+#   python rag.py --build --force    # wipe + re-embed everything (after changing a tuning knob)
 
-import json, urllib.request, pathlib, hashlib, re, math, sys, sqlite3
+import json, urllib.request, urllib.error, pathlib, hashlib, re, math, sys, sqlite3
 import sqlite_vec
 from sqlite_vec import serialize_float32
 
-OLLAMA = "http://127.0.0.1:11434/api/embeddings"
-EMBED_MODEL = "nomic-embed-text"      # `ollama pull nomic-embed-text` (~270 MB, runs on CPU)
+OLLAMA_HOST  = "http://127.0.0.1:11434"
+OLLAMA_EMBED = OLLAMA_HOST + "/api/embed"        # batch endpoint (newer Ollama): {"input": [...]}
+OLLAMA_EMB1  = OLLAMA_HOST + "/api/embeddings"   # single endpoint (older Ollama): {"prompt": "..."}
+EMBED_MODEL  = "nomic-embed-text"                # `ollama pull nomic-embed-text` (~270 MB, CPU-ok)
+EMBED_BATCH  = 64                                # chunks sent per /api/embed request
 HERE = pathlib.Path(__file__).parent
-DB = HERE / "rag_index.db"            # generated cache — git-ignore it
+DB   = HERE / "rag_index.db"                     # generated cache — git-ignored
 
-# Docs to make searchable. Add your own; missing files are skipped (like context.py's HOMELAB).
-SOURCES = [
-    pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md",
-    HERE / "MAG_Z790_TOMAHAWK_MAX_WIFI_User_Guide.md",
-]
+# Docs to make searchable: EVERY *.md in this folder, plus the homelab notes (if present). Missing
+# files are skipped. Drop a new .md in here and the next `python rag.py --build` picks it up.
+SOURCES = [pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md", *sorted(HERE.glob("*.md"))]
 
 # --- tuning knobs (the RAG equivalent of rules.THRESH — tune for YOUR docs) ---
 CHUNK_CHARS = 1200    # size of each searchable slice (~300 tokens)
@@ -35,15 +47,46 @@ DOC_PREFIX   = "search_document: "
 QUERY_PREFIX = "search_query: "
 
 
-def _embed(text: str, prefix: str = DOC_PREFIX) -> list[float]:
-    """One text -> one L2-normalized vector, via Ollama. Normalized so cosine == dot product."""
-    body = json.dumps({"model": EMBED_MODEL, "prompt": prefix + text}).encode()
-    req = urllib.request.Request(OLLAMA, data=body,
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        v = json.loads(r.read())["embedding"]
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)        # build progress -> stderr, never pollutes stdout
+
+
+def _norm(v: list[float]) -> list[float]:
+    """L2-normalize so cosine == dot product (lets sqlite-vec's L2 distance recover cosine)."""
     n = math.sqrt(sum(x * x for x in v)) or 1.0
     return [x / n for x in v]
+
+
+def _embed(text: str, prefix: str = DOC_PREFIX) -> list[float]:
+    """One text -> one normalized vector via the single-item endpoint (the fallback path)."""
+    body = json.dumps({"model": EMBED_MODEL, "prompt": prefix + text}).encode()
+    req = urllib.request.Request(OLLAMA_EMB1, data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return _norm(json.loads(r.read())["embedding"])
+
+
+def _embed_batch(texts: list[str], prefix: str = DOC_PREFIX) -> list[list[float]]:
+    """Many texts -> many normalized vectors in ONE /api/embed call. Falls back to the older
+    one-at-a-time /api/embeddings endpoint if this Ollama is too old to have /api/embed (HTTP 404)."""
+    body = json.dumps({"model": EMBED_MODEL, "input": [prefix + t for t in texts]}).encode()
+    req = urllib.request.Request(OLLAMA_EMBED, data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return [_norm(v) for v in json.loads(r.read())["embeddings"]]
+    except urllib.error.HTTPError as e:
+        if e.code == 404:                          # old Ollama without /api/embed -> single calls
+            return [_embed(t, prefix) for t in texts]
+        raise
+
+
+def _embed_all(texts: list[str], prefix: str = DOC_PREFIX) -> list[list[float]]:
+    """Embed a whole doc's chunks in EMBED_BATCH-sized requests."""
+    out = []
+    for i in range(0, len(texts), EMBED_BATCH):
+        out.extend(_embed_batch(texts[i:i + EMBED_BATCH], prefix))
+    return out
 
 
 def _chunk(text: str) -> list[str]:
@@ -79,24 +122,25 @@ def _chunk(text: str) -> list[str]:
     return chunks or [text]
 
 
-def _load_sources() -> list[tuple[str, str]]:
-    docs = []
+def _load_sources() -> list[tuple[str, str, str]]:
+    """[(name, text, sha256), ...] de-duplicated by resolved path; missing files skipped."""
+    docs, seen = [], set()
     for p in SOURCES:
+        try:
+            rp = p.resolve()
+        except OSError:
+            continue
+        if rp in seen:
+            continue
+        seen.add(rp)
         try:
             t = p.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             continue                          # missing file: skip, exactly like context.py
         if t:
-            docs.append((p.name, t))
+            sha = hashlib.sha256(t.encode("utf-8", "replace")).hexdigest()
+            docs.append((p.name, t, sha))
     return docs
-
-
-def _sig(docs) -> str:
-    """Fingerprint of inputs + settings. If it changes, the cache is stale and we re-embed."""
-    h = hashlib.sha256(f"{CHUNK_CHARS}|{OVERLAP}|{EMBED_MODEL}".encode())
-    for name, text in docs:
-        h.update(name.encode()); h.update(text.encode("utf-8", "replace"))
-    return h.hexdigest()
 
 
 def _connect() -> sqlite3.Connection:
@@ -107,42 +151,78 @@ def _connect() -> sqlite3.Connection:
     return con
 
 
-def _stored_sig(con) -> "str | None":
+def _ensure_schema(con) -> None:
+    con.executescript(
+        "CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY, source TEXT, text TEXT);"
+        "CREATE TABLE IF NOT EXISTS sources(name TEXT PRIMARY KEY, sha TEXT);"
+        "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);"
+    )
+
+
+def _meta_get(con, key: str) -> "str | None":
+    row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _meta_set(con, key: str, value: str) -> None:
+    con.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, value))
+
+
+def _ensure_vec_table(con, dim: int) -> None:
+    """Create the vec0 table on first use; its dimension is fixed at creation, recorded in meta."""
+    if _meta_get(con, "dim") is None:
+        con.execute(f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(embedding float[{dim}])")
+        _meta_set(con, "dim", str(dim))
+
+
+def _delete_source(con, name: str) -> None:
+    """Drop a doc's chunks + vectors (vec table may not exist yet on a first build)."""
     try:
-        row = con.execute("SELECT value FROM meta WHERE key='sig'").fetchone()
-        return row[0] if row else None
+        con.execute("DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE source=?)",
+                    (name,))
     except sqlite3.OperationalError:
-        return None                  # tables don't exist yet (fresh db)
+        pass                              # vec_chunks not created yet
+    con.execute("DELETE FROM chunks WHERE source=?", (name,))
+    con.execute("DELETE FROM sources WHERE name=?", (name,))
 
 
 def build_index(force: bool = False) -> sqlite3.Connection:
-    """Embed every chunk into a sqlite-vec table, cached in rag_index.db. Rebuilds on doc change.
-    Returns an OPEN connection with the extension loaded."""
+    """Embed every NEW or CHANGED source into a sqlite-vec table, cached in rag_index.db. Only the
+    delta is re-embedded (per-source content hash); removed docs are dropped. Returns an OPEN
+    connection with the extension loaded. `force=True` wipes and re-embeds the whole corpus."""
     docs = _load_sources()
-    sig = _sig(docs)
     con = _connect()
-    if not force and _stored_sig(con) == sig:
-        return con                   # docs + settings unchanged -> reuse the embeddings
-    con.executescript(
-        "DROP TABLE IF EXISTS vec_chunks;"
-        "DROP TABLE IF EXISTS chunks;"
-        "DROP TABLE IF EXISTS meta;"
-        "CREATE TABLE chunks(id INTEGER PRIMARY KEY, source TEXT, text TEXT);"
-        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);"
-    )
-    chunks, sources = [], []
-    for name, text in docs:
-        for c in _chunk(text):
-            chunks.append(c); sources.append(name)
-    if chunks:
-        vecs = [_embed(c) for c in chunks]
-        con.execute(f"CREATE VIRTUAL TABLE vec_chunks USING vec0(embedding float[{len(vecs[0])}])")
-        for src, txt, v in zip(sources, chunks, vecs):
-            cur = con.execute("INSERT INTO chunks(source, text) VALUES (?, ?)", (src, txt))
-            con.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)",
+    _ensure_schema(con)
+    settings = f"{CHUNK_CHARS}|{OVERLAP}|{EMBED_MODEL}|{DOC_PREFIX}|{QUERY_PREFIX}"
+    if force or _meta_get(con, "settings") != settings:
+        # a settings change invalidates every stored embedding -> wipe and full rebuild
+        con.executescript("DROP TABLE IF EXISTS vec_chunks;"
+                           "DELETE FROM chunks; DELETE FROM sources; DELETE FROM meta;")
+        _ensure_schema(con)
+        _meta_set(con, "settings", settings)
+    have = dict(con.execute("SELECT name, sha FROM sources").fetchall())
+    current = {name: (text, sha) for name, text, sha in docs}
+    for name in set(have) - set(current):          # docs removed from SOURCES
+        _delete_source(con, name); _log(f"  [removed] {name}")
+    todo = [(n, t, s) for n, (t, s) in current.items() if have.get(n) != s]
+    if not todo:
+        con.commit()
+        return con                                 # nothing new/changed -> reuse the embeddings
+    _log(f"indexing {len(todo)} new/changed doc(s) of {len(current)} (batch={EMBED_BATCH})...")
+    for name, text, sha in todo:
+        _delete_source(con, name)                  # clear stale rows if the doc changed
+        chunks = _chunk(text)
+        if not chunks:
+            continue
+        vecs = _embed_all(chunks)
+        _ensure_vec_table(con, len(vecs[0]))
+        for txt, v in zip(chunks, vecs):
+            cur = con.execute("INSERT INTO chunks(source, text) VALUES(?, ?)", (name, txt))
+            con.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES(?, ?)",
                         (cur.lastrowid, serialize_float32(v)))
-    con.execute("INSERT INTO meta(key, value) VALUES ('sig', ?)", (sig,))
-    con.commit()
+        con.execute("INSERT OR REPLACE INTO sources(name, sha) VALUES(?, ?)", (name, sha))
+        con.commit()                               # commit per doc -> safe to interrupt and resume
+        _log(f"  [indexed] {name}: {len(chunks)} chunks")
     return con
 
 
@@ -201,8 +281,13 @@ def demo():  # the one runnable check
     v = [0.6, 0.8]                             # a unit vector's cosine with itself must be 1
     assert abs(sum(a * b for a, b in zip(v, v)) - 1.0) < 1e-6, "cosine math wrong"
     print("rag chunk/math ok")
+    if not DB.exists():                        # honor "build later": don't kick off a full build here
+        print(f"(index not built yet — run `python rag.py --build` to embed {len(_load_sources())} docs)")
+        return
     try:
-        con = build_index(); n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]; con.close()
+        con = _connect(); n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]; con.close()
+        if not n:
+            print("(index is empty — run `python rag.py --build`)"); return
         hits = retrieve("how is my reverse proxy / homelab networking set up?")
         print(f"rag index ok: {n} chunks; query returned {len(hits)} relevant chunk(s)")
         if hits:
@@ -212,7 +297,11 @@ def demo():  # the one runnable check
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 2 and sys.argv[1] == "--scores":
+    if len(sys.argv) > 1 and sys.argv[1] == "--build":
+        con = build_index(force="--force" in sys.argv)
+        n = con.execute("SELECT count(*) FROM chunks").fetchone()[0]; con.close()
+        print(f"index built: {n} chunks from {len(_load_sources())} doc(s)")
+    elif len(sys.argv) > 2 and sys.argv[1] == "--scores":
         for score, src, txt in _scored(sys.argv[2]):
             print(f"{score:.3f}  [{src}] {txt[:90].strip()}")
     else:

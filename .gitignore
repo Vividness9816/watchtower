@@ -9,7 +9,26 @@ ckpt.pt
 *.pt
 *.safetensors
 history.db
+rag_index.db          # RAG embedding cache — regenerate with `python rag.py --build`
 *.db-journal
+
+# Large generated/scraped RAG corpora (regenerable; see docs/RECREATE-*.md §13).
+# rag.py still indexes these locally via its *.md glob — they're just kept out of git.
+powershell-docs-merged.md
+arch-wiki-merged.md
+linux_wiki.md
+windows-commands.md
+
+# Third-party copyrighted reference docs — indexed locally by rag.py, kept out of the public repo.
+MAG_Z790_TOMAHAWK_MAX_WIFI_User_Guide.md
+sysinternals.md
+WindowsHardwareErrorArchitecture.md
+ansible-core-narrative-docs.md
+kernel-maintainer-handbook.md
+nvidia-smi.md
+
+# Local agent / security-sweep artifacts (never commit)
+.claude/
 
 # Secrets / env
 .env
