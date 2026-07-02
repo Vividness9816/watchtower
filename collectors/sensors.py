@@ -66,6 +66,8 @@ cpu_matches = ([v for k, v in temps.items() if "cpu" in k.lower() and "package" 
                or [v for k, v in temps.items() if "cpu" in k.lower()])
 liquid = pick(temps, "liquid") or pick(temps, "coolant") or pick(temps, "water")
 pump = pick(fans, "pump")
+if pump == 0 and liquid is None:
+    pump = None      # 0-RPM 'Pump Fan' with no liquid temp = unpopulated mobo header, not the AIO
 aio_note = None
 if liquid is None:
     liquid, pump2, aio_note = liquidctl_read()

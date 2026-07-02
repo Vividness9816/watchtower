@@ -50,16 +50,25 @@ with gr.Blocks(title="Watch Tower") as app:
                           "Is my GPU temp normal for this card?"],
             )
     gr.Markdown("## Live graphs")
+
+    def live_plot_component(sel, span):
+        # return a FULL component, not a bare DataFrame: the plot frontend freezes its
+        # series/color encoding from the first value it receives, so bare-value updates
+        # silently drop any series that wasn't present at page load (e.g. everything,
+        # when the page loads seconds after app start). Rebuilding the component each
+        # tick re-derives the encoding, so new series appear live.
+        return gr.LinePlot(live.frame(sel, span), x="time", y="value", color="series",
+                           title="Live (5s fast tier; net/whea every 60s)", height=320)
+
+    DEFAULT_SEL = ["CPU temp (C)", "GPU temp (C)", "Liquid temp (C)"]
     with gr.Row():
         live_sel = gr.Dropdown(list(live.METRICS), multiselect=True, label="Metrics",
-                               value=["CPU temp (C)", "GPU temp (C)", "Liquid temp (C)"])
+                               value=DEFAULT_SEL)
         live_span = gr.Dropdown(list(live.SPANS), value="15 min", label="Window")
-    live_plot = gr.LinePlot(live.frame(["CPU temp (C)", "GPU temp (C)", "Liquid temp (C)"]),
-                            x="time", y="value", color="series",
-                            title="Live (5s fast tier; net/whea every 60s)", height=320)
-    gr.Timer(5).tick(live.frame, inputs=[live_sel, live_span], outputs=live_plot)
-    live_sel.change(live.frame, [live_sel, live_span], live_plot)
-    live_span.change(live.frame, [live_sel, live_span], live_plot)
+    live_plot = live_plot_component(DEFAULT_SEL, "15 min")
+    gr.Timer(5).tick(live_plot_component, inputs=[live_sel, live_span], outputs=live_plot)
+    live_sel.change(live_plot_component, [live_sel, live_span], live_plot)
+    live_span.change(live_plot_component, [live_sel, live_span], live_plot)
 
     gr.Markdown("## History")
     with gr.Row():
