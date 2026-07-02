@@ -1,16 +1,25 @@
 import json, glob, subprocess, sys, pathlib, argparse
+from concurrent.futures import ThreadPoolExecutor
 HERE = pathlib.Path(__file__).parent
 
 
 def snapshot(only=None) -> dict:
     snap = {}
     pattern = str(HERE / "collectors" / (f"{only}.py" if only else "*.py"))
-    for f in sorted(glob.glob(pattern)):
-        try:
-            out = subprocess.run([sys.executable, f], capture_output=True, text=True, timeout=25).stdout
-            snap.update(json.loads(out))            # collectors namespace their own keys
-        except Exception as e:
-            snap.setdefault("_errors", []).append(f"{pathlib.Path(f).name}: {e}")
+    files = [f for f in sorted(glob.glob(pattern))
+             if not pathlib.Path(f).name.startswith("_")]   # _*.py = shared libs, not collectors
+
+    def run_one(f):
+        # -P keeps collectors/ off the child's sys.path so usb.py/power.py can't shadow pip pkgs
+        return subprocess.run([sys.executable, "-P", f],
+                              capture_output=True, text=True, timeout=25).stdout
+
+    with ThreadPoolExecutor(max_workers=min(8, len(files) or 1)) as ex:
+        for f, fut in [(f, ex.submit(run_one, f)) for f in files]:
+            try:
+                snap.update(json.loads(fut.result()))    # collectors namespace their own keys
+            except Exception as e:
+                snap.setdefault("_errors", []).append(f"{pathlib.Path(f).name}: {e}")
     return snap
 
 
@@ -37,11 +46,16 @@ def narrate():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", nargs="?", default="diag", help="diag | net | report")
+    ap.add_argument("cmd", nargs="?", default="diag", help="diag | net | report | discover")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-llm", action="store_true")
+    ap.add_argument("--spawn", action="store_true", help="discover: write stub collectors")
     args = ap.parse_args()
 
+    if args.cmd == "discover":
+        import discover
+        discover.main(spawn=args.spawn)
+        return
     if args.cmd == "report" and not args.no_llm:
         narrate()
         return

@@ -148,14 +148,30 @@ No env vars, no secrets. Tune these in source:
 
 ```
 schema.py rules.py data.py gpt.py train.py infer.py   # tiny GPT
-sysdiag.py history.py                                  # truth layer + logger
+sysdiag.py history.py discover.py                      # truth layer + logger + bus discovery
 context.py brain.py                                    # Ollama chat brain
 art.py trends.py app.py chat.py                        # UI / CLI
 system_facts.md  requirements.txt  .gitignore
-collectors/   cpu mem disk gpu sensors net docker k3s whea tpm me usb storage  (.py)
+collectors/   cpu mem disk gpu sensors net docker k3s whea tpm me usb storage
+              lights power                             # RGB state (OpenRGB) + boot forensics
+              sdr rx tx tuner  _sdr_common             # SDR skeletons (fill when hardware lands)
 docs/         RECREATE-WINDOWS.md  RECREATE-LINUX.md
 # generated (git-ignored): corpus.txt* vocab.json ckpt.pt history.db   (*corpus is deterministic)
 ```
+
+**Deep sensors.** `sensors.py` reads LibreHardwareMonitor's whole tree (every temp — CPU/VRM/
+chipset/NVMe/GPU-hotspot — every fan **and pump** RPM, AIO **liquid temp**), with a `liquidctl`
+fallback for the AIO when LHM is down (note: NZXT CAM holds the Kraken's HID exclusively — close
+CAM or run LHM). `gpu.py` adds decoded throttle reasons, PCIe link gen/width current-vs-max,
+fan %, P-state and clocks. `power.py` counts Kernel-Power 41 / 6008 / throttle events — the
+software-visible shadow of the board's debug LEDs (which are POST-time hardware and unreadable).
+`lights.py` reads actual RGB zone state through the OpenRGB SDK server.
+
+**Bus discovery.** `python sysdiag.py discover` scans USB/PCI (PnP) + COM ports and maps known
+devices (SDRs, AIOs, RGB) to the collector that should cover them; add `--spawn` to write a stub
+collector for a recognized device that has none — the snapshot glob picks it up automatically.
+The SDR skeletons (`sdr/rx/tx/tuner.py`) run today and emit `present:false`; their `FILL-ME`
+blocks document the intended channel-power / PLL-lock probes to complete when hardware arrives.
 
 > **Linux note:** the Linux release swaps the PowerShell collectors for
 > psutil/lm-sensors/MCE equivalents and omits the Windows-only `tpm`/`me` collectors. The shared
