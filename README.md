@@ -257,8 +257,11 @@ Key-based auth only — set up an SSH key first (`ssh-copy-id`); passwords are d
 (`ProxyJump`). A check can carry `warn`/`crit`/`unit` thresholds: numeric results are
 threshold-checked into findings, an unreachable target is a WARN, and every scraped value
 lands in the snapshot so the chat brain can reason about it ("is the db VM's disk filling
-up?"). Runs in the 60s full tier — comfortable for a modest fleet; large fleets want a
-trimmed `full` list or a longer collector timeout. Example check with a threshold:
+up?"). Threshold **direction is inferred**: `crit > warn` is higher-is-worse (disk %, load);
+`crit < warn` is lower-is-worse (cert days left, free GB) and fires when the value drops below.
+The collector self-bounds to a ~20s wall-clock budget (under the 25s collector kill) — a hung
+VM or one bad target degrades to that one target, never the whole fleet — so scale by splitting
+configs across agents rather than a single huge target list. Example high-is-worse check:
 `"disk_root_pct": { "cmd": "df --output=pcent / | tail -1 | tr -dc 0-9", "warn": 85, "crit": 95, "unit": "%" }`.
 
 **Virtual machines & services.** `vm.py` reports Hyper-V VMs and their **encryption posture**

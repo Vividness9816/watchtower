@@ -13,13 +13,16 @@
 #     yours to keep read-only.
 #   * One SSH session per target (all its checks run in that one session); targets run in
 #     parallel with per-connect timeouts so an unreachable VM degrades instead of hanging.
-import json, os, re, shlex, shutil, subprocess
-from concurrent.futures import ThreadPoolExecutor
+import json, math, os, re, shlex, shutil, subprocess, threading, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG = os.environ.get("WATCHTOWER_SSH_CONFIG", os.path.join(REPO, "ssh.config.json"))
 SSH = shutil.which("ssh")
-DEST_RE = re.compile(r"^[A-Za-z0-9._-]+(@[A-Za-z0-9._-]+)?$")   # user@host / host; no leading '-'
+# user@host / host; first char alnum/./_ so a value can't start with '-' and pose as an ssh
+# option (e.g. -oProxyCommand=...). Belt-and-suspenders — the config is operator-authored.
+DEST_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*(@[A-Za-z0-9._][A-Za-z0-9._-]*)?$")
+BUDGET = 20          # wall-clock ceiling for the whole collector, under the 25s parent kill
+PER_TARGET = 14      # per-target ssh cap; < BUDGET so one target can't blow the whole budget
 
 
 def _coerce(s):
@@ -31,20 +34,25 @@ def _coerce(s):
     except ValueError:
         pass
     try:
-        return float(s)
+        f = float(s)
+        return f if math.isfinite(f) else s   # keep nan/inf as text -> valid JSON, no fake pass
     except ValueError:
         return s
 
 
 def _normalize_checks(raw):
     """Each check -> {'cmd': str, 'warn'?, 'crit'?, 'unit'?}. Accepts a bare command string
-    or an object with thresholds."""
+    or an object with thresholds. Names carrying a tab/newline are dropped — they'd corrupt
+    the name<TAB>value wire format."""
     out = {}
     for name, spec in (raw or {}).items():
+        name = str(name)
+        if "\t" in name or "\n" in name:
+            continue
         if isinstance(spec, str):
-            out[str(name)] = {"cmd": spec}
+            out[name] = {"cmd": spec}
         elif isinstance(spec, dict) and isinstance(spec.get("cmd"), str):
-            out[str(name)] = {k: spec[k] for k in ("cmd", "warn", "crit", "unit") if k in spec}
+            out[name] = {k: spec[k] for k in ("cmd", "warn", "crit", "unit") if k in spec}
     return out
 
 
@@ -61,29 +69,29 @@ def _remote_script(checks):
 
 def _scrape(target, connect_timeout):
     name = str(target.get("name") or target.get("ssh") or "?")
-    dest = target.get("ssh") or target.get("host")
-    checks = _normalize_checks(target.get("checks"))
-    if not dest or not DEST_RE.match(str(dest)):
-        return name, {"reachable": False, "error": "invalid or missing 'ssh' destination"}
-    if not checks:
-        return name, {"reachable": False, "error": "no checks configured"}
-
-    strict = "accept-new" if target.get("accept_new") else "yes"
-    argv = [SSH, "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
-            "-o", f"ConnectTimeout={int(connect_timeout)}",
-            "-o", f"StrictHostKeyChecking={strict}",
-            "-p", str(int(target.get("port", 22)))]
-    key = target.get("key")
-    if key:
-        argv += ["-o", "IdentitiesOnly=yes", "-i", os.path.expanduser(str(key))]
-    jump = target.get("jump")                       # optional bastion/ProxyJump
-    if jump and DEST_RE.match(str(jump)):
-        argv += ["-J", str(jump)]
-    argv += [str(dest), _remote_script(checks)]
-
+    # EVERYTHING that can raise on operator-typo'd config lives inside this try, so one bad
+    # target degrades to reachable:false instead of taking down the whole collector.
     try:
+        dest = target.get("ssh") or target.get("host")
+        checks = _normalize_checks(target.get("checks"))
+        if not dest or not DEST_RE.match(str(dest)):
+            return name, {"reachable": False, "error": "invalid or missing 'ssh' destination"}
+        if not checks:
+            return name, {"reachable": False, "error": "no checks configured"}
+        port = int(target.get("port") or 22)        # '' / None / '22a' -> caught below
+        strict = "accept-new" if target.get("accept_new") else "yes"
+        argv = [SSH, "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+                "-o", f"ConnectTimeout={connect_timeout}",
+                "-o", f"StrictHostKeyChecking={strict}", "-p", str(port)]
+        key = target.get("key")
+        if key:
+            argv += ["-o", "IdentitiesOnly=yes", "-i", os.path.expanduser(str(key))]
+        jump = target.get("jump")                   # optional bastion/ProxyJump
+        if jump and DEST_RE.match(str(jump)):
+            argv += ["-J", str(jump)]
+        argv += [str(dest), _remote_script(checks)]
         r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=int(connect_timeout) + 12)
+                           errors="replace", timeout=PER_TARGET)
     except subprocess.TimeoutExpired:
         return name, {"reachable": False, "error": "timeout"}
     except Exception as e:
@@ -123,9 +131,33 @@ def main():
     if not isinstance(targets, list) or not targets:
         print(json.dumps({"ssh": {"present": False}}))
         return
-    ct = int(cfg.get("connect_timeout", 6))
-    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as ex:
-        results = dict(ex.map(lambda t: _scrape(t, ct), targets))
+    try:
+        ct = max(1, min(int(cfg.get("connect_timeout", 6)), 8))
+    except (TypeError, ValueError):
+        ct = 6
+
+    # daemon workers + a hard wall-clock join deadline: the collector ALWAYS returns within
+    # BUDGET (< the 25s parent kill), even with a hung post-auth check or a large fleet.
+    # Targets not finished by the deadline are reported as budget-exceeded rather than losing
+    # the whole ssh namespace (which is what a parent-timeout kill would do).
+    results, lock, sem = {}, threading.Lock(), threading.Semaphore(24)
+
+    def work(t):
+        with sem:
+            name, r = _scrape(t, ct)
+        with lock:
+            results[name] = r
+
+    threads = [threading.Thread(target=work, args=(t,), daemon=True) for t in targets]
+    deadline = time.monotonic() + BUDGET
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(max(0.0, deadline - time.monotonic()))
+    for t in targets:                               # fill in anything the deadline cut off
+        name = str(t.get("name") or t.get("ssh") or "?")
+        with lock:
+            results.setdefault(name, {"reachable": False, "error": "collector time budget exceeded"})
     down = sum(1 for r in results.values() if not r.get("reachable"))
     print(json.dumps({"ssh": {"present": True, "down": down, "targets": results}}))
 

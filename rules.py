@@ -118,7 +118,9 @@ def diagnose(snap: dict) -> list[dict]:
         out.append({"level": "CRIT" if failed >= 3 else "WARN", "what": "failed services",
                     "value": names or failed, "limit": "", "unit": ""})
 
-    # remote SSH-scraped VMs: unreachable target -> WARN; each check carries its own thresholds
+    # remote SSH-scraped VMs: unreachable target -> WARN; each check carries its own thresholds.
+    # Fully type-guarded: this block sees semi-trusted JSON from a monitored box over the remote
+    # ingest path, so a malformed checks/warn/crit must not crash diagnose().
     ssh_targets = _get(snap, "ssh", "targets")
     if isinstance(ssh_targets, dict):
         for tname, t in ssh_targets.items():
@@ -128,13 +130,23 @@ def diagnose(snap: dict) -> list[dict]:
                 out.append({"level": "WARN", "what": f"SSH target unreachable ({tname})",
                             "value": t.get("error", "no reply"), "limit": "", "unit": ""})
                 continue
-            for cname, c in (t.get("checks") or {}).items():
+            checks = t.get("checks")
+            if not isinstance(checks, dict):
+                continue
+            for cname, c in checks.items():
                 if not isinstance(c, dict) or not isinstance(c.get("value"), (int, float)):
                     continue
-                v, warn, crit, unit = c["value"], c.get("warn"), c.get("crit"), c.get("unit", "")
-                if crit is not None and v >= crit:
+                v = c["value"]
+                warn = c["warn"] if isinstance(c.get("warn"), (int, float)) else None
+                crit = c["crit"] if isinstance(c.get("crit"), (int, float)) else None
+                unit = c.get("unit", "")
+                # direction inferred from the thresholds: crit < warn means lower-is-worse
+                # (cert days left, free GB) -> fire when value drops BELOW; else higher-is-worse.
+                low = warn is not None and crit is not None and crit < warn
+                hit = (lambda th: v <= th) if low else (lambda th: v >= th)
+                if crit is not None and hit(crit):
                     out.append({"level": "CRIT", "what": f"{tname}:{cname}", "value": v, "limit": crit, "unit": unit})
-                elif warn is not None and v >= warn:
+                elif warn is not None and hit(warn):
                     out.append({"level": "WARN", "what": f"{tname}:{cname}", "value": v, "limit": warn, "unit": unit})
 
     # NIC errors + sick resolver (cached lookups slow = resolver itself is unhealthy)
@@ -186,11 +198,20 @@ def demo():  # the one runnable check: a hot GPU MUST raise CRIT
     svc = {"services": {"failed": 2, "failed_units": ["nginx.service", "sshd.service"]}}
     assert any("failed services" in f["what"] and "nginx" in str(f["value"]) for f in diagnose(svc)), "service rule broken"
     ssh_snap = {"ssh": {"targets": {
-        "db-vm": {"reachable": True, "checks": {"disk_root_pct": {"value": 96, "warn": 85, "crit": 95, "unit": "%"}}},
+        "db-vm": {"reachable": True, "checks": {
+            "disk_root_pct": {"value": 96, "warn": 85, "crit": 95, "unit": "%"},   # high-is-worse
+            "cert_days_left": {"value": 3, "warn": 30, "crit": 7, "unit": "d"}}},   # low-is-worse
         "web-vm": {"reachable": False, "error": "timeout"}}}}
     sf = diagnose(ssh_snap)
-    assert any(f["level"] == "CRIT" and "db-vm:disk_root_pct" in f["what"] for f in sf), "ssh threshold rule broken"
+    assert any(f["level"] == "CRIT" and "db-vm:disk_root_pct" in f["what"] for f in sf), "ssh high threshold broken"
+    assert any(f["level"] == "CRIT" and "db-vm:cert_days_left" in f["what"] for f in sf), "ssh low-is-worse broken"
     assert any("unreachable (web-vm)" in f["what"] for f in sf), "ssh unreachable rule broken"
+    # a healthy cert (many days left) must NOT fire, and malformed remote input must not crash
+    assert not any("cert" in f["what"] for f in diagnose({"ssh": {"targets": {"x": {"reachable": True,
+        "checks": {"cert_days_left": {"value": 90, "warn": 30, "crit": 7}}}}}})), "healthy cert false-fired"
+    for bad in ([1, 2, 3], "pwn", 5):
+        diagnose({"ssh": {"targets": {"x": {"reachable": True, "checks": bad}}}})       # no crash
+    diagnose({"ssh": {"targets": {"x": {"reachable": True, "checks": {"c": {"value": 9, "crit": "x"}}}}}})
     print("rules ok")
 
 
