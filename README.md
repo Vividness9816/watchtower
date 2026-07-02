@@ -85,8 +85,14 @@ Full, copy-paste, step-by-step guides with expected output for every command:
 
 - **Windows:** [`docs/RECREATE-WINDOWS.md`](docs/RECREATE-WINDOWS.md)
 - **Linux:** [`docs/RECREATE-LINUX.md`](docs/RECREATE-LINUX.md)
+- **Component & config reference** (every file, every knob, remote monitoring, NiFi, SSH, how to
+  write a collector): [`docs/INSTRUCTIONS.md`](docs/INSTRUCTIONS.md)
 - *(optional)* **Add local RAG to the chat:** [`docs/ADD-RAG.md`](docs/ADD-RAG.md) — semantic
   retrieval over your own reference docs, zero new pip deps (one `ollama pull`)
+
+> The two RECREATE guides are **generated** from the live source by `docs/gen_recreate.py`
+> (`python docs/gen_recreate.py`) so their embedded code never drifts — re-run it after changing
+> any component.
 
 The short version:
 
@@ -151,11 +157,13 @@ schema.py rules.py data.py gpt.py train.py infer.py   # tiny GPT
 sysdiag.py history.py discover.py                      # truth layer + logger + bus discovery
 context.py brain.py                                    # Ollama chat brain
 art.py trends.py live.py app.py chat.py                # UI / CLI + live sampler
+ship.py discover.py                                   # remote-monitoring agent + bus discovery
 system_facts.md  requirements.txt  .gitignore
+ship.config.example.json  ssh.config.example.json     # copy → *.config.json (gitignored) to configure
 collectors/   cpu mem disk gpu sensors net docker k3s whea tpm me usb storage
               lights power vm services ssh             # RGB + boot forensics + Hyper-V + systemd + remote-VM SSH
               sdr rx tx tuner antenna  _sdr_common     # SDR/antenna skeletons (fill when hardware lands)
-docs/         RECREATE-WINDOWS.md  RECREATE-LINUX.md
+docs/         INSTRUCTIONS.md  RECREATE-WINDOWS.md  RECREATE-LINUX.md  gen_recreate.py (generates the two RECREATE guides)
 # generated (git-ignored): corpus.txt* vocab.json ckpt.pt history.db   (*corpus is deterministic)
 ```
 

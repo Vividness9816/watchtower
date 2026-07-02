@@ -1,94 +1,78 @@
 # Watch Tower — Recreate From Scratch (Linux)
 
-A complete, copy-paste guide to rebuild this project on a fresh Linux workstation on a different
-network. Every file's full contents are included; every command shows its expected output. Work
-top to bottom.
+A complete, copy-paste guide to rebuild this project on a fresh Linux machine. Every file's
+full contents are included (generated from the live source by `docs/gen_recreate.py`, so they
+match the code exactly), every command shows its expected output. Work top to bottom.
 
-> Sibling guide: `RECREATE-WINDOWS.md`. This file is Linux-only. The **machine-learning core,
-> UI, and chat brain are identical across both**; only the *collectors* (live sensors), a couple
-> of paths, and the scheduler differ. Where a file is identical to Windows it is still printed
-> here in full so this guide is standalone.
+> Sibling guide: `RECREATE-WINDOWS.md`. This file is Linux-only. For a component/config *reference*
+> (what each file does, every knob, remote monitoring, NiFi, SSH), see `docs/INSTRUCTIONS.md`.
 
 ---
 
 ## 0. What you are building
 
-**Watch Tower** = three layers:
+**Watch Tower** is a local, read-only PC health tool with three layers:
 
-1. **Truth layer (`sysdiag` + `collectors/`)** — scripts that read real sensors and emit JSON;
-   `rules.py` turns JSON into severity-ranked findings.
+1. **Truth layer (`sysdiag` + `collectors/`)** — standalone scripts that read real sensors and
+   each print one JSON object; `sysdiag.py` runs them all in parallel and merges the result;
+   `rules.py` turns that snapshot into severity-ranked findings.
 2. **A from-scratch character-level GPT (`gpt.py` + `train.py`)** — trained on *synthetic*
-   snapshots, fully offline, no downloads.
+   snapshots so it learns to write a short health report from a metrics line. No downloads.
 3. **A big-model chat brain (`brain.py` + `context.py`)** — talks to **Ollama** running
-   `qwen2.5:32b` locally, grounded in the live snapshot + findings. CLI (`chat.py`) + Gradio web
-   app (`app.py`) with a live panel and history graph.
+   `qwen2.5:32b` locally, grounded in the live snapshot + findings + trends. Exposed as a CLI
+   (`chat.py`) and a Gradio web app (`app.py`) with a host selector, live graphs, and history.
 
 ```
 collectors/*.py ──► sysdiag.py ──► snapshot{json} ──► rules.py ──► findings[]
-                                      │
-          ┌───────────────────────────┼───────────────────────────────┐
-          ▼                           ▼                               ▼
-   schema.serialize ─► tiny GPT   context.build ─► brain.ask ─► Ollama qwen2.5:32b
-   (train.py/infer.py)             (chat.py CLI + app.py web UI + history graph)
+                                        │
+        ┌────────────────────────────────┼─────────────────────────────────┐
+        ▼                               ▼                                   ▼
+  schema.serialize ─► tiny GPT   context.build ─► brain.ask ─► Ollama   live.py ring ─► graphs
 ```
 
-The tiny GPT (you train it, ~10 MB) and the 32B Ollama model (downloaded, ~19 GB) are
-independent — run either, both, or neither.
+Two independent "AIs": the **tiny GPT you train** (offline, ~44 MB) and the **32B Ollama model**
+(downloaded, ~19 GB). They are separate — run the dashboard with either, both, or neither.
+
+Beyond the basics this build includes: deep sensors (VRM/NVMe temps, AIO liquid temp, GPU
+throttle/PCIe), boot/power forensics, RGB state, Hyper-V/libvirt VM encryption posture, systemd
+services, an **in-app live sampler** with graphs, **remote monitoring** (one dashboard watches
+many machines via `ship.py`/NiFi), an **SSH collector** that scrapes remote Linux VMs, and
+device discovery. See `docs/INSTRUCTIONS.md` for the reference on those.
 
 ---
 
 ## 1. Prerequisites
 
+Debian/Ubuntu shown; translate to your distro.
+
 ```bash
-# Debian/Ubuntu shown; translate to your distro's package manager.
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip git lm-sensors curl
-sudo sensors-detect --auto          # one-time: probe temp/fan chips for lm-sensors
+sudo apt update && sudo apt install -y python3 python3-venv python3-pip git \
+     lm-sensors smartmontools usbutils openssh-client
+sudo sensors-detect            # answer the prompts once
+pip install psutil             # the Linux collectors use psutil
 ```
 
-| Tool | Why | Install / check |
-|---|---|---|
-| **Python 3.10+** | runs everything | `python3 --version` |
-| **NVIDIA driver + CUDA GPU** | trains the GPT; runs the 32B model | `nvidia-smi` must print your GPU |
-| **Ollama** | serves the 32B chat model | `curl -fsSL https://ollama.com/install.sh \| sh` |
-| **lm-sensors** | CPU temp + fan RPM (`collectors/sensors.py`) | `sensors` must print temps |
-| **Docker** *(optional)* | `docker`/`k3s` collectors | distro docker + add yourself to the `docker` group |
-
-Verify:
-```bash
-python3 --version
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-ollama --version
-sensors | head
-```
-Expected (yours differ):
-```
-Python 3.12.3
-<GPU>, <VRAM>
-ollama version is 0.30.8
-coretemp-isa-0000
-Package id 0:  +41.0°C  (high = +100.0°C, crit = +100.0°C)
-```
-> If `sensors` shows no CPU temp, re-run `sudo sensors-detect` and load the suggested modules.
+Plus: an **NVIDIA driver** (`nvidia-smi`) for GPU + the 32B model, **Ollama**
+(ollama.com/download), and optionally **Docker**, **k3s**, **OpenRGB** (SDK server) for those
+collectors.
 
 ---
 
 ## 2. Create the project folder
 
 ```bash
-mkdir -p ~/sysdiag/collectors ~/sysdiag/docs
-cd ~/sysdiag
+mkdir -p ~/sysdiag/collectors ~/sysdiag/docs && cd ~/sysdiag
 ```
-
-All paths below are relative to `~/sysdiag`.
 
 ---
 
-## 3. The machine-learning core (offline tiny GPT) — identical to Windows
+## 3. The machine-learning core (offline tiny GPT)
 
-These six files have **no OS-specific code**. Paste them exactly.
+These files build, train, and run a character-level transformer with zero downloads. They are
+**identical across Windows and Linux** (pure Python + torch).
 
 ### `schema.py`
+
 ```python
 import random
 
@@ -142,7 +126,7 @@ def synthetic_snapshot(rng: random.Random) -> dict:
     }
 
 
-def demo():  # train/serve symmetry check
+def demo():  # train/serve symmetry check: real-shaped and synthetic-shaped serialize the same way
     rng = random.Random(0)
     real = {"cpu": {"load": 5}, "sensors": {"cpu_temp": 45}, "mem": {"pct": 43},
             "gpu": {"util": 3, "temp": 39, "power": 64, "vram_pct": 12},
@@ -158,13 +142,18 @@ if __name__ == "__main__":
 ```
 
 ### `rules.py`
+
 ```python
 # (warn, crit). THIS is your per-machine tuning knob — edit for your silicon.
 THRESH = {
-    "cpu_temp": (90, 98),   # <CPU> TjMax ~100
-    "gpu_temp": (80, 88),   # <GPU> edge
-    "mem_pct":  (85, 95),
-    "disk_pct": (85, 95),
+    "cpu_temp":    (90, 98),   # <CPU> TjMax ~100
+    "gpu_temp":    (80, 88),   # <GPU> edge
+    "mem_pct":     (85, 95),
+    "disk_pct":    (85, 95),
+    "liquid_temp": (45, 55),   # AIO coolant; >55C the loop has lost the battle
+    "drive_temp":  (70, 80),   # NVMe throttle band
+    "dns_ms":      (500, 2000),  # steady-state (cached) resolve
+    "dns_cold_ms": (5000, 15000),  # resolver->upstream path; this LAN has shown 11s legit-slow
 }
 
 
@@ -200,28 +189,175 @@ def diagnose(snap: dict) -> list[dict]:
         for mount, pct in disk.items():
             chk(pct, "disk_pct", f"disk {mount}", "%")
 
+    # WHEA / hardware errors -> straight to CRIT (no threshold; any is bad)
     whea = _get(snap, "whea", "recent_errors")
     if whea:
         out.append({"level": "CRIT", "what": "WHEA hardware errors", "value": whea, "limit": "", "unit": ""})
 
+    # cooling rule (a rule, not a reading): hot AND the fan that matters is stalled.
+    # Unpopulated headers legitimately read 0 RPM forever, so judge only the CPU fan(s) —
+    # or a total stall (every reported fan at 0).
     cpu_temp = _get(snap, "sensors", "cpu_temp")
-    fans = _get(snap, "sensors", "fans") or {}
-    if cpu_temp and cpu_temp >= 90 and fans and min(fans.values()) == 0:
+    fans = _get(snap, "sensors", "fans")
+    fans = fans if isinstance(fans, dict) else {}   # remote JSON may send a non-dict; don't crash
+    cpu_fans = {k: v for k, v in fans.items()
+                if "cpu" in str(k).lower() and isinstance(v, (int, float))}
+    numeric = [v for v in fans.values() if isinstance(v, (int, float))]
+    if cpu_temp and cpu_temp >= 90 and numeric and (
+            (cpu_fans and min(cpu_fans.values()) == 0) or max(numeric) == 0):
         out.append({"level": "CRIT", "what": "cooling (hot + stalled fan)", "value": cpu_temp, "limit": "", "unit": "C"})
 
+    # liquid cooling: coolant temp + pump-stalled-while-warm
+    liquid = _get(snap, "sensors", "liquid_temp")
+    chk(liquid, "liquid_temp", "coolant temp")
+    pump = _get(snap, "sensors", "pump_rpm")
+    if liquid is not None and liquid >= 45 and pump == 0:
+        out.append({"level": "CRIT", "what": "AIO pump (stalled while coolant warm)",
+                    "value": 0, "limit": "", "unit": "RPM"})
+
+    # GPU throttling: thermal/hardware slowdowns are findings; sw_power_cap at load is normal
+    throttle = _get(snap, "gpu", "throttle") or []
+    hard = [r for r in throttle if r in ("hw_thermal", "hw_slowdown", "hw_power_brake")]
+    soft = [r for r in throttle if r == "sw_thermal"]
+    if hard:
+        out.append({"level": "CRIT", "what": "GPU hardware slowdown", "value": ",".join(hard), "limit": "", "unit": ""})
+    elif soft:
+        out.append({"level": "WARN", "what": "GPU thermal throttling", "value": ",".join(soft), "limit": "", "unit": ""})
+
+    # PCIe link degraded — judged only under load (idle legitimately downshifts gen AND width)
+    util = _get(snap, "gpu", "util") or 0
+    pcie = _get(snap, "gpu", "pcie") or {}
+    if util >= 30 and pcie.get("gen") and pcie.get("gen_max") and (
+            pcie["gen"] < pcie["gen_max"] or (pcie.get("width") or 0) < (pcie.get("width_max") or 0)):
+        out.append({"level": "WARN", "what": "PCIe link degraded under load",
+                    "value": f"gen{pcie['gen']}x{pcie.get('width')}",
+                    "limit": f"gen{pcie['gen_max']}x{pcie.get('width_max')}", "unit": ""})
+
+    # storage depth: error totals, drive temps, disk-subsystem event noise
+    for d in _get(snap, "storage", "drives") or []:
+        if not isinstance(d, dict):     # PS 5.1 wraps an empty pipeline as [null]
+            continue
+        errs = (d.get("read_errs") or 0) + (d.get("write_errs") or 0)
+        if errs:
+            out.append({"level": "WARN", "what": f"drive errors ({d.get('name')})",
+                        "value": errs, "limit": "", "unit": ""})
+        chk(d.get("temp"), "drive_temp", f"drive temp ({d.get('name')})")
+    ev = _get(snap, "storage", "disk_events_24h")
+    if ev:
+        out.append({"level": "WARN", "what": "disk error events (24h)", "value": ev, "limit": "", "unit": ""})
+
+    # power forensics: the machine died without a clean shutdown / firmware throttled the CPU
+    dirty = max(_get(snap, "power", "dirty_reboots_7d") or 0,
+                _get(snap, "power", "unexpected_shutdowns_7d") or 0)
+    if dirty:
+        out.append({"level": "CRIT" if dirty >= 3 else "WARN",
+                    "what": "dirty shutdowns (7d)", "value": dirty, "limit": "", "unit": ""})
+    thr = _get(snap, "power", "cpu_throttle_events_24h")
+    if thr:
+        out.append({"level": "WARN", "what": "CPU throttle events (24h)", "value": thr, "limit": "", "unit": ""})
+
+    # systemd: a failed unit is a clear signal; name the units so the fix is obvious
+    failed = _get(snap, "services", "failed")
+    if failed:
+        units = _get(snap, "services", "failed_units") or []
+        names = ", ".join(str(u) for u in units[:5]) if isinstance(units, list) else ""
+        out.append({"level": "CRIT" if failed >= 3 else "WARN", "what": "failed services",
+                    "value": names or failed, "limit": "", "unit": ""})
+
+    # remote SSH-scraped VMs: unreachable target -> WARN; each check carries its own thresholds.
+    # Fully type-guarded: this block sees semi-trusted JSON from a monitored box over the remote
+    # ingest path, so a malformed checks/warn/crit must not crash diagnose().
+    ssh_targets = _get(snap, "ssh", "targets")
+    if isinstance(ssh_targets, dict):
+        for tname, t in ssh_targets.items():
+            if not isinstance(t, dict):
+                continue
+            if t.get("reachable") is False:
+                out.append({"level": "WARN", "what": f"SSH target unreachable ({tname})",
+                            "value": t.get("error", "no reply"), "limit": "", "unit": ""})
+                continue
+            checks = t.get("checks")
+            if not isinstance(checks, dict):
+                continue
+            for cname, c in checks.items():
+                if not isinstance(c, dict) or not isinstance(c.get("value"), (int, float)):
+                    continue
+                v = c["value"]
+                warn = c["warn"] if isinstance(c.get("warn"), (int, float)) else None
+                crit = c["crit"] if isinstance(c.get("crit"), (int, float)) else None
+                unit = c.get("unit", "")
+                # direction inferred from the thresholds: crit < warn means lower-is-worse
+                # (cert days left, free GB) -> fire when value drops BELOW; else higher-is-worse.
+                low = warn is not None and crit is not None and crit < warn
+                hit = (lambda th: v <= th) if low else (lambda th: v >= th)
+                if crit is not None and hit(crit):
+                    out.append({"level": "CRIT", "what": f"{tname}:{cname}", "value": v, "limit": crit, "unit": unit})
+                elif warn is not None and hit(warn):
+                    out.append({"level": "WARN", "what": f"{tname}:{cname}", "value": v, "limit": warn, "unit": unit})
+
+    # NIC errors + sick resolver (cached lookups slow = resolver itself is unhealthy)
+    nic_errs = (_get(snap, "net", "rx_errors") or 0) + (_get(snap, "net", "tx_errors") or 0)
+    if nic_errs:
+        out.append({"level": "WARN", "what": "NIC packet errors", "value": nic_errs, "limit": "", "unit": ""})
+    chk(_get(snap, "net", "dns_ms"), "dns_ms", "DNS resolve", "ms")
+    chk(_get(snap, "net", "dns_cold_ms"), "dns_cold_ms", "DNS cold resolve", "ms")
+    # resolver DEAD (dns_ms None while raw-IP ping works) = "internet up but nothing loads"
+    if "net" in snap and _get(snap, "net", "dns_ms") is None and _get(snap, "net", "ping_ms") is not None:
+        out.append({"level": "CRIT", "what": "DNS resolution (ping OK, resolve fails)",
+                    "value": "no answer", "limit": "", "unit": ""})
+
+    # internet down
     if "net" in snap and _get(snap, "net", "ping_ms") is None:
         out.append({"level": "CRIT", "what": "internet (1.1.1.1)", "value": "no reply", "limit": "", "unit": ""})
 
+    # any collector that returned {"error": ...} is itself a (low-sev) finding
     for k, v in snap.items():
         if isinstance(v, dict) and "error" in v:
             out.append({"level": "WARN", "what": f"{k} sensor", "value": v["error"], "limit": "", "unit": ""})
 
+    # a collector that died outright (timeout/bad JSON) must surface too, not vanish
+    for msg in snap.get("_errors") or []:
+        out.append({"level": "WARN", "what": "collector failed", "value": msg, "limit": "", "unit": ""})
+
     return out
 
 
-def demo():  # a hot GPU MUST raise CRIT
+def demo():  # the one runnable check: a hot GPU MUST raise CRIT
     hot = {"gpu": {"temp": 99}, "net": {"ping_ms": 12}, "whea": {"recent_errors": 0}}
     assert any(f["level"] == "CRIT" for f in diagnose(hot)), "rule engine broken"
+    stalled = {"sensors": {"liquid_temp": 48, "pump_rpm": 0}}
+    assert any("pump" in f["what"] for f in diagnose(stalled)), "pump rule broken"
+    idle_pcie = {"gpu": {"util": 3, "pcie": {"gen": 1, "gen_max": 5, "width": 8, "width_max": 16}}}
+    assert not any("PCIe" in f["what"] for f in diagnose(idle_pcie)), "idle PCIe must not flag"
+    loaded_pcie = {"gpu": {"util": 95, "pcie": {"gen": 1, "gen_max": 5, "width": 8, "width_max": 16}}}
+    assert any("PCIe" in f["what"] for f in diagnose(loaded_pcie)), "loaded PCIe must flag"
+    throttling = {"gpu": {"throttle": ["hw_thermal"]}}
+    assert any(f["level"] == "CRIT" and "slowdown" in f["what"] for f in diagnose(throttling)), "throttle rule broken"
+    bad_drive = {"storage": {"drives": [None, {"name": "X", "read_errs": 3, "write_errs": 0}]}}
+    assert any("drive errors" in f["what"] for f in diagnose(bad_drive)), "drive-error rule broken (or [null] crash)"
+    dead_dns = {"net": {"ping_ms": 12, "dns_ms": None}}
+    assert any("DNS resolution" in f["what"] for f in diagnose(dead_dns)), "dead-resolver rule broken"
+    unpopulated = {"sensors": {"cpu_temp": 95, "fans": {"CPU Fan": 1500, "System Fan #5": 0}}}
+    assert not any("cooling" in f["what"] for f in diagnose(unpopulated)), "empty header must not CRIT"
+    died = {"_errors": ["net.py: timeout"]}
+    assert any("collector failed" in f["what"] for f in diagnose(died)), "_errors must surface"
+    svc = {"services": {"failed": 2, "failed_units": ["nginx.service", "sshd.service"]}}
+    assert any("failed services" in f["what"] and "nginx" in str(f["value"]) for f in diagnose(svc)), "service rule broken"
+    ssh_snap = {"ssh": {"targets": {
+        "db-vm": {"reachable": True, "checks": {
+            "disk_root_pct": {"value": 96, "warn": 85, "crit": 95, "unit": "%"},   # high-is-worse
+            "cert_days_left": {"value": 3, "warn": 30, "crit": 7, "unit": "d"}}},   # low-is-worse
+        "web-vm": {"reachable": False, "error": "timeout"}}}}
+    sf = diagnose(ssh_snap)
+    assert any(f["level"] == "CRIT" and "db-vm:disk_root_pct" in f["what"] for f in sf), "ssh high threshold broken"
+    assert any(f["level"] == "CRIT" and "db-vm:cert_days_left" in f["what"] for f in sf), "ssh low-is-worse broken"
+    assert any("unreachable (web-vm)" in f["what"] for f in sf), "ssh unreachable rule broken"
+    # a healthy cert (many days left) must NOT fire, and malformed remote input must not crash
+    assert not any("cert" in f["what"] for f in diagnose({"ssh": {"targets": {"x": {"reachable": True,
+        "checks": {"cert_days_left": {"value": 90, "warn": 30, "crit": 7}}}}}})), "healthy cert false-fired"
+    for bad in ([1, 2, 3], "pwn", 5):
+        diagnose({"ssh": {"targets": {"x": {"reachable": True, "checks": bad}}}})       # no crash
+    diagnose({"ssh": {"targets": {"x": {"reachable": True, "checks": {"c": {"value": 9, "crit": "x"}}}}}})
     print("rules ok")
 
 
@@ -230,6 +366,7 @@ if __name__ == "__main__":
 ```
 
 ### `data.py`
+
 ```python
 import sys, random
 import schema, rules
@@ -285,6 +422,7 @@ if __name__ == "__main__":
 ```
 
 ### `gpt.py`
+
 ```python
 from __future__ import annotations
 import json
@@ -298,8 +436,11 @@ from torch.nn import functional as F
 from schema import EOS  # document separator / end-of-sequence marker
 
 
+# =================================================================== tokenizer
 class CharTokenizer:
-    """One integer per character. Fully transparent. Always includes EOS in the vocab."""
+    """The simplest honest tokenizer: one integer per character. Fully transparent -
+    you can see exactly how text becomes the integers the model consumes. (Upgrade to
+    BPE later; see README.) Always includes EOS in the vocab."""
 
     def __init__(self, itos: list[str]):
         self.itos = itos
@@ -334,49 +475,61 @@ class CharTokenizer:
             return cls(json.load(f)["itos"])
 
 
+# =================================================================== config
 @dataclass
 class GPTConfig:
     vocab_size: int = 128
-    block_size: int = 256
+    block_size: int = 256   # max context the model can attend over
     n_layer: int = 6
     n_head: int = 6
-    n_embd: int = 384
+    n_embd: int = 384       # must be divisible by n_head
     dropout: float = 0.1
-    bias: bool = True
+    bias: bool = True       # bias in Linear/LayerNorm
 
 
+# =================================================================== attention
 class CausalSelfAttention(nn.Module):
+    """Multi-head self-attention with a causal mask so position t can only attend to
+    positions <= t. This is the only place tokens exchange information."""
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
         self.n_head = cfg.n_head
         self.n_embd = cfg.n_embd
+        # one matmul produces q, k, v together: (C) -> (3C)
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=cfg.bias)
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=cfg.bias)
         self.attn_dropout = nn.Dropout(cfg.dropout)
         self.resid_dropout = nn.Dropout(cfg.dropout)
+        # lower-triangular causal mask, registered as a buffer (moves with .to(device),
+        # not a learnable parameter). Shape (1,1,block,block) to broadcast over B and nh.
         self.register_buffer(
             "tril",
             torch.tril(torch.ones(cfg.block_size, cfg.block_size)).view(1, 1, cfg.block_size, cfg.block_size),
         )
 
-    def forward(self, x):
+    def forward(self, x):                       # x: (B, T, C)
         B, T, C = x.shape
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)   # each (B, T, C)
         hs = C // self.n_head
+        # split C into (nh, hs) and move heads to the batch-like dim -> (B, nh, T, hs)
         q = q.view(B, T, self.n_head, hs).transpose(1, 2)
         k = k.view(B, T, self.n_head, hs).transpose(1, 2)
         v = v.view(B, T, self.n_head, hs).transpose(1, 2)
+        # attention scores: (B,nh,T,hs) @ (B,nh,hs,T) -> (B,nh,T,T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(hs))
-        att = att.masked_fill(self.tril[:, :, :T, :T] == 0, float("-inf"))
+        att = att.masked_fill(self.tril[:, :, :T, :T] == 0, float("-inf"))  # causal
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = att @ v                              # (B,nh,T,T) @ (B,nh,T,hs) -> (B,nh,T,hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)     # reassemble heads -> (B,T,C)
         return self.resid_dropout(self.c_proj(y))
 
 
 class MLP(nn.Module):
+    """Position-wise feed-forward: expand 4x, GELU, project back."""
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd, bias=cfg.bias)
@@ -388,6 +541,8 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
+    """Pre-norm residual block: x = x + attn(ln(x)); x = x + mlp(ln(x))."""
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.ln_1 = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
@@ -401,17 +556,20 @@ class Block(nn.Module):
         return x
 
 
+# =================================================================== full model
 class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         self.cfg = cfg
-        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)
-        self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)   # (V, C)
+        self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)   # (block, C)
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
         self.ln_f = nn.LayerNorm(cfg.n_embd, bias=cfg.bias)
-        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
-        self.tok_emb.weight = self.lm_head.weight   # weight tying
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)  # (C, V)
+        # weight tying: input embedding and output projection share weights (GPT-2 trick,
+        # fewer params, usually better).
+        self.tok_emb.weight = self.lm_head.weight
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -423,18 +581,19 @@ class GPT(nn.Module):
             nn.init.normal_(m.weight, mean=0.0, std=0.02)
 
     def num_params(self) -> int:
+        # subtract tied head so we don't double-count
         return sum(p.numel() for p in self.parameters()) - self.lm_head.weight.numel()
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None):       # idx: (B, T) longs
         B, T = idx.shape
         assert T <= self.cfg.block_size, f"sequence {T} > block_size {self.cfg.block_size}"
-        pos = torch.arange(T, device=idx.device)
-        x = self.tok_emb(idx) + self.pos_emb(pos)
+        pos = torch.arange(T, device=idx.device)                 # (T,)
+        x = self.tok_emb(idx) + self.pos_emb(pos)                # (B,T,C) + (T,C) broadcast
         x = self.drop(x)
         for blk in self.blocks:
             x = blk(x)
         x = self.ln_f(x)
-        logits = self.lm_head(x)
+        logits = self.lm_head(x)                                 # (B, T, V)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
@@ -444,16 +603,17 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=0.8, top_k=None, eos_id=None):
+        """Autoregressive sampling. idx: (B,T) seed. Stops early if B==1 and eos_id emitted."""
         self.eval()
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.cfg.block_size:]
+            idx_cond = idx[:, -self.cfg.block_size:]             # crop to context window
             logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / max(temperature, 1e-6)
+            logits = logits[:, -1, :] / max(temperature, 1e-6)   # last step -> (B,V)
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float("-inf")
             probs = F.softmax(logits, dim=-1)
-            nxt = torch.multinomial(probs, num_samples=1)
+            nxt = torch.multinomial(probs, num_samples=1)        # (B,1)
             idx = torch.cat((idx, nxt), dim=1)
             if eos_id is not None and idx.size(0) == 1 and nxt.item() == eos_id:
                 break
@@ -461,6 +621,7 @@ class GPT(nn.Module):
 ```
 
 ### `train.py`
+
 ```python
 import math
 import os
@@ -485,6 +646,7 @@ grad_clip    = 1.0
 n_layer, n_head, n_embd, dropout = 6, 6, 384, 0.1
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+# bf16 on Blackwell needs no GradScaler; fall back to fp32 on CPU.
 use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
 ctx_dtype = torch.bfloat16 if use_bf16 else torch.float32
 torch.manual_seed(1337)
@@ -496,11 +658,12 @@ def get_lr(it):
     if it > max_iters:
         return min_lr
     ratio = (it - warmup_iters) / (max_iters - warmup_iters)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))
+    coeff = 0.5 * (1.0 + math.cos(math.pi * ratio))   # cosine decay 1 -> 0
     return min_lr + coeff * (learning_rate - min_lr)
 
 
 def main():
+    # --- data ---
     if not os.path.exists("corpus.txt"):
         print("corpus.txt missing - generating 8000 docs")
         open("corpus.txt", "w", encoding="utf-8").write(build_corpus(8000))
@@ -520,11 +683,13 @@ def main():
         y = torch.stack([d[i + 1:i + 1 + block_size] for i in ix])
         return x.to(device), y.to(device)
 
+    # --- model ---
     cfg = GPTConfig(vocab_size=tok.vocab_size, block_size=block_size,
                     n_layer=n_layer, n_head=n_head, n_embd=n_embd, dropout=dropout)
     model = GPT(cfg).to(device)
     print(f"model params: {model.num_params()/1e6:.2f}M")
 
+    # weight decay only on 2D matmul weights, not biases/layernorm/embeddings
     decay, nodecay = [], []
     for p in model.parameters():
         (decay if p.dim() >= 2 else nodecay).append(p)
@@ -558,6 +723,7 @@ def main():
         txt = tok.decode(out[0].tolist())
         return txt.split("REPORT\n")[-1].split("\x03")[0]
 
+    # --- loop ---
     model.train()
     for it in range(max_iters + 1):
         for g in optimizer.param_groups:
@@ -568,7 +734,7 @@ def main():
             print(f"iter {it:5d} | train {losses['train']:.4f} | val {losses['val']:.4f} "
                   f"| lr {get_lr(it):.2e}")
             print("   sample:", sample_report().replace("\n", " ")[:240])
-            model.train()
+            model.train()  # generate() left the model in eval(); resume training mode
 
         x, y = get_batch("train")
         with torch.autocast(device_type=device, dtype=ctx_dtype) if device == "cuda" else _null():
@@ -583,6 +749,7 @@ def main():
 
 
 class _null:
+    """no-op context manager for the CPU path (autocast cuda only)."""
     def __enter__(self): return None
     def __exit__(self, *a): return False
 
@@ -592,6 +759,7 @@ if __name__ == "__main__":
 ```
 
 ### `infer.py`
+
 ```python
 from __future__ import annotations
 import argparse
@@ -645,152 +813,352 @@ if __name__ == "__main__":
     main()
 ```
 
----
-
 ## 4. The collectors (live Linux sensors)
 
-The Linux collectors use **psutil**, **lm-sensors**, **nvidia-smi**, and the kernel log — no
-PowerShell. They emit the same JSON shape as the Windows ones, so `rules.py`/`schema.py` are
-unchanged. Install psutil into the venv (done in step 6).
+Each is a standalone script that prints one namespaced JSON object and **degrades** when its
+subsystem is absent. Several are cross-platform and identical to the Windows repo files
+(`docker`, `ssh`, the `sdr`/`rx`/`tx`/`tuner`/`antenna` skeletons, `lights` via OpenRGB, and
+`services` — which already runs native `systemctl` on Linux). The hardware collectors below are
+Linux-native (psutil / lm-sensors / journalctl / lspci) — the shared `schema.py`/`rules.py` are
+unchanged, and root `/` is aliased to the disk key `C` so the trained model's `disk_C` input
+stays populated.
 
-> **Disk key note:** `schema.py` reads `disk.C` (a Windows drive letter). The Linux `disk.py`
-> below **aliases the root filesystem `/` to the key `C`** so the trained model's `disk_C` input
-> stays populated. Other mounts appear under their real mountpoint.
+> Install the Linux sensor deps: `pip install psutil` and `sudo apt install lm-sensors
+> smartmontools usbutils` then `sudo sensors-detect`. GPU/Docker/k3s/SSH collectors need their
+> respective tools (`nvidia-smi`, `docker`, `k3s`, `ssh`).
+>
+> **Omitted on Linux:** `tpm.py` and `me.py` are Windows-only (Get-Tpm / the Intel ME driver).
+> Skip them; the shared `rules.py` simply sees no `tpm`/`me` keys. If you want TPM state on
+> Linux, add a collector that reads `/sys/class/tpm/`.
 
-### `collectors/cpu.py`
+### `collectors/cpu.py` (Linux)
+
 ```python
 # collectors/cpu.py (Linux) — core counts + live load via psutil.
-import json, psutil
+import json
 try:
-    load = int(round(psutil.cpu_percent(interval=0.3)))
+    import psutil
     print(json.dumps({"cpu": {"cores": psutil.cpu_count(logical=False),
-                              "logical": psutil.cpu_count(logical=True), "load": load}}))
+                              "logical": psutil.cpu_count(logical=True),
+                              "load": int(psutil.cpu_percent(interval=0.5))}}))
 except Exception as e:
     print(json.dumps({"cpu": {"error": str(e)}}))
 ```
 
-### `collectors/mem.py`
+### `collectors/mem.py` (Linux)
+
 ```python
 # collectors/mem.py (Linux) — RAM used% via psutil.
-import json, psutil
+import json
 try:
-    print(json.dumps({"mem": {"pct": int(round(psutil.virtual_memory().percent))}}))
+    import psutil
+    print(json.dumps({"mem": {"pct": int(psutil.virtual_memory().percent)}}))
 except Exception as e:
     print(json.dumps({"mem": {"error": str(e)}}))
 ```
 
-### `collectors/disk.py`
+### `collectors/disk.py` (Linux)
+
 ```python
-# collectors/disk.py (Linux) — used% per real mountpoint, with root '/' aliased to "C" so the
-# trained model's `disk_C` input stays populated (schema.py is shared with the Windows build).
-import json, psutil
+# collectors/disk.py (Linux) — used% per real mountpoint; root '/' aliased to "C"
+# so the trained model's shared `disk_C` input stays populated.
+import json, shutil, psutil
 out = {}
-for part in psutil.disk_partitions(all=False):
-    try:
-        pct = int(round(psutil.disk_usage(part.mountpoint).percent))
-    except (PermissionError, OSError):
+for p in psutil.disk_partitions(all=False):
+    if "loop" in p.device or not p.mountpoint:
         continue
-    out["C" if part.mountpoint == "/" else part.mountpoint] = pct
+    try:
+        pct = int(shutil.disk_usage(p.mountpoint).used * 100 / shutil.disk_usage(p.mountpoint).total)
+    except OSError:
+        continue
+    key = "C" if p.mountpoint == "/" else p.mountpoint.strip("/").replace("/", "_") or "root"
+    out[key] = pct
 print(json.dumps({"disk": out}))
 ```
 
-### `collectors/gpu.py`
-```python
-# collectors/gpu.py (Linux) — nvidia-smi (ships with the driver). Absent GPU -> degrades.
-import json, subprocess, shutil
-smi = shutil.which("nvidia-smi")
-try:
-    if not smi:
-        raise FileNotFoundError("nvidia-smi not found")
-    q = "utilization.gpu,temperature.gpu,power.draw,memory.used,memory.total"
-    row = subprocess.run([smi, f"--query-gpu={q}", "--format=csv,noheader,nounits"],
-                         capture_output=True, text=True, timeout=10).stdout.strip()
-    u, t, p, used, total = (x.strip() for x in row.split(","))
-    print(json.dumps({"gpu": {"util": int(float(u)), "temp": int(float(t)),
-                              "power": int(float(p)),
-                              "vram_pct": round(100 * float(used) / float(total))}}))
-except Exception as e:
-    print(json.dumps({"gpu": {"error": str(e)}}))
-```
+### `collectors/sensors.py` (Linux)
 
-### `collectors/sensors.py`
 ```python
 # collectors/sensors.py (Linux) — CPU package temp + fan RPM via lm-sensors (psutil).
-# Needs `lm-sensors` installed and `sudo sensors-detect` run once.
-import json, psutil
+# Needs `lm-sensors` installed and `sudo sensors-detect` run once. Reports the same keys the
+# shared rules.py/schema.py expect (cpu_temp, fans) plus a full temps map + liquid_temp if the
+# AIO exposes one to lm-sensors.
+import json
 try:
-    temps = psutil.sensors_temperatures()
-    cpu = None
-    for chip in ("coretemp", "k10temp", "zenpower"):
-        for e in temps.get(chip, []):
-            lbl = (e.label or "").lower()
-            if e.current and ("package" in lbl or "tctl" in lbl):
-                cpu = e.current
-        if cpu is None and temps.get(chip):
-            vals = [e.current for e in temps[chip] if e.current]
-            cpu = max(vals) if vals else None
-        if cpu is not None:
-            break
-    fans = {}
+    import psutil
+    temps, fans = {}, {}
+    for chip, entries in (psutil.sensors_temperatures() or {}).items():
+        for e in entries:
+            temps[f"{chip}: {e.label or 'temp'}"] = e.current
     for chip, entries in (psutil.sensors_fans() or {}).items():
         for e in entries:
-            fans[f"{chip}:{e.label or 'fan'}"] = int(e.current)
-    print(json.dumps({"sensors": {"cpu_temp": int(cpu) if cpu else None, "fans": fans}}))
+            fans[f"{chip}: {e.label or 'fan'}"] = e.current
+    cpu = [v for k, v in temps.items() if any(t in k.lower() for t in ("package", "tctl", "coretemp", "k10temp"))]
+    liquid = next((v for k, v in temps.items() if any(t in k.lower() for t in ("liquid", "coolant", "water"))), None)
+    print(json.dumps({"sensors": {"cpu_temp": int(max(cpu)) if cpu else None,
+                                  "fans": fans, "temps": temps, "liquid_temp": liquid,
+                                  "pump_rpm": next((v for k, v in fans.items() if "pump" in k.lower()), None)}}))
 except Exception as e:
     print(json.dumps({"sensors": {"error": str(e)}}))
 ```
 
-### `collectors/net.py`
+### `collectors/net.py` (Linux)
+
 ```python
-# collectors/net.py (Linux) — ping 1.1.1.1 (stdlib) + link state (psutil).
-import json, subprocess, re, psutil
+# collectors/net.py (Linux) — ping 1.1.1.1 (stdlib) + link/error counters via psutil
+# + cold/warm DNS resolve timing (a slow steady-state resolve = a sick resolver).
+import json, subprocess, re, socket, time
+
+
 def ping(host="1.1.1.1"):
     try:
-        out = subprocess.run(["ping", "-c", "1", "-w", "2", host],
-                             capture_output=True, text=True, timeout=5).stdout
+        out = subprocess.run(["ping", "-c", "1", host], capture_output=True, text=True, timeout=5).stdout
         m = re.search(r"time[=<]\s*([\d.]+)\s*ms", out)
         return int(float(m.group(1))) if m else None
     except Exception:
         return None
-def link():
+
+
+def dns_ms(name="example.com"):
+    t0 = time.perf_counter()
     try:
-        for name, s in psutil.net_if_stats().items():
-            if name != "lo" and s.isup:
-                return {"name": name, "speed": (f"{s.speed} Mbps" if s.speed else None)}
-    except Exception:
-        pass
-    return {}
-lk = link()
-print(json.dumps({"net": {"ping_ms": ping(), "target": "1.1.1.1",
-                          "up": bool(lk), "name": lk.get("name"), "speed": lk.get("speed")}}))
+        socket.getaddrinfo(name, 443)
+        return int((time.perf_counter() - t0) * 1000)
+    except OSError:
+        return None
+
+
+try:
+    import psutil
+    up = next((n for n, s in psutil.net_if_stats().items() if s.isup and n != "lo"), None)
+    io = psutil.net_io_counters(pernic=True).get(up) if up else None
+    print(json.dumps({"net": {"ping_ms": ping(), "target": "1.1.1.1", "dns_ms": dns_ms(),
+                              "up": bool(up), "name": up,
+                              "rx_errors": getattr(io, "errin", None), "tx_errors": getattr(io, "errout", None)}}))
+except Exception as e:
+    print(json.dumps({"net": {"error": str(e)}}))
 ```
 
-### `collectors/whea.py`  (Linux = MCE / kernel Hardware Error events)
+### `collectors/whea.py` (Linux)
+
 ```python
 # collectors/whea.py (Linux) — Linux has no WHEA; the equivalent is MCE / "Hardware Error"
 # events in the kernel log. Count recent ones from journalctl. Key stays "whea" so the shared
 # schema.py/rules.py are unchanged. (journalctl -k may need the systemd-journal group / root.)
 import json, subprocess
-def main():
-    try:
-        out = subprocess.run(["journalctl", "-k", "--no-pager", "--since", "-24h"],
-                             capture_output=True, text=True, timeout=15).stdout.lower()
-        errs = sum(1 for ln in out.splitlines()
-                   if "hardware error" in ln or "mce:" in ln or "machine check" in ln)
-        print(json.dumps({"whea": {"recent_errors": errs, "latest": None}}))
-    except Exception as e:
-        print(json.dumps({"whea": {"error": str(e), "recent_errors": 0}}))
-if __name__ == "__main__":
-    main()
+try:
+    out = subprocess.run(["journalctl", "-k", "--since", "-24h", "--no-pager"],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20).stdout
+    errs = [ln for ln in out.splitlines() if "Hardware Error" in ln or "mce:" in ln.lower() or "MCE" in ln]
+    print(json.dumps({"whea": {"recent_errors": len(errs), "latest": (errs[-1][:200] if errs else None)}}))
+except Exception as e:
+    print(json.dumps({"whea": {"error": str(e)}}))
 ```
 
-### `collectors/docker.py`  (optional; needs Docker + `docker` group)
+### `collectors/k3s.py` (Linux)
+
 ```python
-# collectors/docker.py (Linux) — Docker container state + live usage, parsed to numbers.
-import json, re, subprocess, shutil, sys
+# collectors/k3s.py (Linux) — k3s runs natively. Uses `sudo -n` so it works unattended IF
+# passwordless `k3s kubectl` is allowed; otherwise it degrades. If your user already has
+# KUBECONFIG set, change K3S_CMD to ["kubectl","get","pods","-A","-o","json"].
+import json, subprocess
+K3S_CMD = ["sudo", "-n", "k3s", "kubectl", "get", "pods", "-A", "-o", "json"]
+try:
+    r = subprocess.run(K3S_CMD, capture_output=True, text=True, timeout=25)
+    if r.returncode != 0:
+        print(json.dumps({"k3s": {"error": (r.stderr or "kubectl failed").strip()[:200]}}))
+    else:
+        items = json.loads(r.stdout).get("items", [])
+        pods = [{"name": i["metadata"]["name"], "namespace": i["metadata"]["namespace"],
+                 "phase": i.get("status", {}).get("phase")} for i in items]
+        running = sum(1 for p in pods if p["phase"] == "Running")
+        print(json.dumps({"k3s": {"running": running, "total": len(pods), "pods": pods}}))
+except Exception as e:
+    print(json.dumps({"k3s": {"error": str(e)}}))
+```
 
-DOCKER = shutil.which("docker")
+### `collectors/usb.py` (Linux)
 
+```python
+# collectors/usb.py (Linux) — USB device count via lsusb (apt install usbutils).
+import json, subprocess
+try:
+    out = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=10).stdout
+    n = len([ln for ln in out.splitlines() if ln.strip()])
+    print(json.dumps({"usb": {"devices": n, "problems": 0}}))
+except FileNotFoundError:
+    print(json.dumps({"usb": {"present": False, "note": "lsusb not installed (apt install usbutils)"}}))
+except Exception as e:
+    print(json.dumps({"usb": {"error": str(e)}}))
+```
+
+### `collectors/storage.py` (Linux)
+
+```python
+# collectors/storage.py (Linux) — drive health via smartctl (apt install smartmontools).
+# SMART usually needs root, so unprivileged this degrades. Uses `smartctl --scan` then queries.
+import json, subprocess
+def sc(*a):
+    return subprocess.run(["smartctl", *a], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=20)
+try:
+    scan = sc("--scan").stdout
+    drives = []
+    for ln in scan.splitlines():
+        dev = ln.split()[0] if ln.strip() else None
+        if not dev:
+            continue
+        r = sc("-H", "-A", "-j", dev)
+        try:
+            d = json.loads(r.stdout)
+            drives.append({"name": d.get("model_name", dev), "media": "SSD" if d.get("rotation_rate", 1) == 0 else "HDD",
+                           "health": "Healthy" if d.get("smart_status", {}).get("passed") else "Unknown",
+                           "temp": d.get("temperature", {}).get("current")})
+        except Exception:
+            drives.append({"name": dev, "health": "Unknown"})
+    print(json.dumps({"storage": {"drives": drives, "disk_events_24h": 0}}))
+except FileNotFoundError:
+    print(json.dumps({"storage": {"present": False, "note": "smartctl not installed / needs root"}}))
+except Exception as e:
+    print(json.dumps({"storage": {"error": str(e)}}))
+```
+
+### `collectors/power.py` (Linux)
+
+```python
+# collectors/power.py (Linux) — power/boot forensics: unclean shutdowns via the journal's
+# boot list vs `last -x` reboots, and thermal-throttle messages in the kernel log. The Linux
+# analogue of the Windows Kernel-Power 41 / throttle-37 collector. Keys mirror the Windows one.
+import json, subprocess
+def jr(*a):
+    return subprocess.run(a, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20).stdout
+try:
+    boots = jr("journalctl", "--list-boots", "--no-pager")
+    # an unclean shutdown shows a boot with no clean "systemd-shutdown" at its tail; approximate
+    # with `last -x | grep crash` (kernel crash/abrupt) counts over the recent window.
+    crashes = len([ln for ln in jr("last", "-x", "-n", "50").splitlines() if "crash" in ln.lower()])
+    throttle = len([ln for ln in jr("journalctl", "-k", "--since", "-24h", "--no-pager").splitlines()
+                    if "thermal" in ln.lower() and ("throttl" in ln.lower() or "critical" in ln.lower())])
+    print(json.dumps({"power": {"dirty_reboots_7d": crashes, "unexpected_shutdowns_7d": crashes,
+                                "cpu_throttle_events_24h": throttle}}))
+except Exception as e:
+    print(json.dumps({"power": {"error": str(e)}}))
+```
+
+### `collectors/vm.py` (Linux)
+
+```python
+# collectors/vm.py (Linux) — KVM/libvirt VMs + LUKS/confidential-computing encryption
+# posture (the Linux analogue of the Windows Hyper-V collector). Needs libvirt (`virsh`).
+# "encrypted" here = the domain XML declares a launch-security type (SEV/SEV-SNP/TDX) or a
+# LUKS-backed disk; adapt to your definition. Degrades to present:false without libvirt.
+import json, shutil, subprocess
+if not shutil.which("virsh"):
+    print(json.dumps({"vm": {"present": False}}))
+    raise SystemExit
+def vsh(*a):
+    return subprocess.run(["virsh", *a], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=20).stdout
+try:
+    names = [ln.split(None, 2)[1] for ln in vsh("list", "--all").splitlines()[2:] if ln.split()[1:2]]
+    vms = []
+    for n in names:
+        state = "Running" if "running" in vsh("domstate", n).lower() else "Off"
+        xml = vsh("dumpxml", n)
+        enc = ("launchSecurity" in xml) or ("luks" in xml.lower())
+        vms.append({"name": n, "state": state, "encrypted": enc,
+                    "vtpm": "<tpm" in xml.lower(), "secure_boot": "loader secure='yes'" in xml.lower()})
+    if not vms:
+        print(json.dumps({"vm": {"present": False}}))
+    else:
+        print(json.dumps({"vm": {"present": True, "total": len(vms),
+                                 "running": sum(1 for v in vms if v["state"] == "Running"),
+                                 "encrypted": sum(1 for v in vms if v["encrypted"]), "vms": vms}}))
+except Exception as e:
+    print(json.dumps({"vm": {"error": str(e)}}))
+```
+
+### Cross-platform collectors (identical to the Windows repo files)
+
+These need no Linux changes — `gpu` (nvidia-smi), `docker`, `services` (native `systemctl`), `ssh`, `lights` (OpenRGB SDK), and the SDR skeletons. Embedded here for completeness.
+
+### `collectors/gpu.py`
+
+```python
+# collectors/gpu.py — nvidia-smi deep query (ships with the driver, zero pip):
+# util/temp/power/vram (frozen keys) + fan %, P-state, SM clock vs max, power limit,
+# PCIe link gen/width current-vs-max, and decoded throttle reasons. Absent GPU -> degrades.
+import json, subprocess, shutil
+smi = shutil.which("nvidia-smi") or r"C:\Windows\System32\nvidia-smi.exe"
+
+THROTTLE = {0x1: "idle", 0x2: "app_clocks", 0x4: "sw_power_cap", 0x8: "hw_slowdown",
+            0x10: "sync_boost", 0x20: "sw_thermal", 0x40: "hw_thermal",
+            0x80: "hw_power_brake", 0x100: "display_clocks"}
+
+
+def q(fields):
+    # 7s x up-to-3 calls = 21s worst case, safely under sysdiag's 25s kill switch
+    r = subprocess.run([smi, f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+                       capture_output=True, text=True, timeout=7)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise RuntimeError((r.stderr or r.stdout).strip()[:200] or f"nvidia-smi rc={r.returncode}")
+    return [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")]
+
+
+def num(x):  # "[N/A]" / "N/A" / "" -> None
+    try:
+        return float(x)
+    except ValueError:
+        return None
+
+
+def i(x):
+    n = num(x)
+    return None if n is None else int(n)
+
+
+try:
+    (u, t, p, used, total, fan, pstate, sm, smmax,
+     gen, genmax, w, wmax, plim) = q(
+        "utilization.gpu,temperature.gpu,power.draw,memory.used,memory.total,"
+        "fan.speed,pstate,clocks.sm,clocks.max.sm,pcie.link.gen.current,pcie.link.gen.max,"
+        "pcie.link.width.current,pcie.link.width.max,power.limit")
+    reasons = None
+    for f in ("clocks_event_reasons.active", "clocks_throttle_reasons.active"):
+        try:                                       # field renamed across driver generations
+            mask = int(q(f)[0], 16)
+            reasons = [n for b, n in THROTTLE.items() if mask & b and n != "idle"]
+            break
+        except Exception:
+            continue
+    vram = round(100 * num(used) / num(total)) if num(used) is not None and num(total) else None
+    print(json.dumps({"gpu": {
+        "util": i(u), "temp": i(t), "power": i(p), "vram_pct": vram,
+        "fan_pct": i(fan), "pstate": pstate, "sm_mhz": i(sm), "sm_max_mhz": i(smmax),
+        "power_limit": i(plim), "throttle": reasons,
+        "pcie": {"gen": i(gen), "gen_max": i(genmax), "width": i(w), "width_max": i(wmax)},
+    }}))
+except FileNotFoundError:
+    print(json.dumps({"gpu": {"present": False}}))  # no NVIDIA driver at all: a state, not an error
+except Exception as e:
+    msg = str(e)
+    if "No devices were found" in msg or "couldn't communicate" in msg:
+        print(json.dumps({"gpu": {"present": False}}))
+    else:
+        print(json.dumps({"gpu": {"error": msg}}))  # driver present but sick = a real finding
+```
+
+### `collectors/docker.py`
+
+```python
+# collectors/docker.py — Docker container state + live resource usage, PARSED to numbers.
+# Merges `docker ps` (name/image/status/ports) with `docker stats` (cpu/mem/net/block I/O/pids).
+import json, re, subprocess, shutil, os, sys
+
+_DEFAULT = r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"
+DOCKER = shutil.which("docker.exe") or (_DEFAULT if os.path.exists(_DEFAULT) else None)
+
+# go-units: memory uses binary (KiB/MiB/GiB); net & block I/O use decimal (kB/MB/GB).
 _UNITS = {"b": 1, "kb": 1000, "mb": 1000**2, "gb": 1000**3, "tb": 1000**4,
           "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4}
 
@@ -834,7 +1202,7 @@ def _run(args):
 
 def main():
     if not DOCKER:
-        print(json.dumps({"docker": {"error": "docker not found (installed? in the docker group?)"}}))
+        print(json.dumps({"docker": {"error": "docker.exe not found (is Docker Desktop installed?)"}}))
         return
     try:
         ps = _run(["ps", "--all", "--format", "{{json .}}"])
@@ -849,20 +1217,32 @@ def main():
             net_rx, net_tx = _pair(st.get("NetIO"))
             blk_r, blk_w = _pair(st.get("BlockIO"))
             containers.append({
-                "name": r.get("Names"), "image": r.get("Image"), "status": r.get("Status"),
-                "ports": r.get("Ports") or "", "cpu_pct": _pct(st.get("CPUPerc")),
-                "mem_used_bytes": mem_used, "mem_limit_bytes": mem_limit, "mem_pct": _pct(st.get("MemPerc")),
-                "net_rx_bytes": net_rx, "net_tx_bytes": net_tx,
-                "blk_read_bytes": blk_r, "blk_write_bytes": blk_w, "pids": _int(st.get("PIDs")),
+                "name": r.get("Names"),
+                "image": r.get("Image"),
+                "status": r.get("Status"),
+                "ports": r.get("Ports") or "",
+                "cpu_pct": _pct(st.get("CPUPerc")),
+                "mem_used_bytes": mem_used,
+                "mem_limit_bytes": mem_limit,
+                "mem_pct": _pct(st.get("MemPerc")),
+                "net_rx_bytes": net_rx,
+                "net_tx_bytes": net_tx,
+                "blk_read_bytes": blk_r,
+                "blk_write_bytes": blk_w,
+                "pids": _int(st.get("PIDs")),
             })
         running = sum(1 for r in ps if str(r.get("Status", "")).startswith("Up"))
-        print(json.dumps({"docker": {"running": running, "total": len(containers), "containers": containers}}))
+        print(json.dumps({"docker": {"running": running, "total": len(containers),
+                                     "containers": containers}}))
     except Exception as e:
         print(json.dumps({"docker": {"error": str(e)}}))
 
 
-def demo():
+def demo():  # parser self-check: python docker.py --test
     assert _bytes("120MiB") == 125829120
+    assert _bytes("1.2kB") == 1200
+    assert _bytes("0B") == 0
+    assert _pct("0.15%") == 0.15
     assert _pair("120MiB / 7.6GiB") == (125829120, int(7.6 * 1024**3))
     assert _int("12") == 12 and _int(None) is None
     print("docker parsers ok")
@@ -872,85 +1252,611 @@ if __name__ == "__main__":
     (demo if "--test" in sys.argv else main)()
 ```
 
-### `collectors/k3s.py`  (optional; native k3s)
-```python
-# collectors/k3s.py (Linux) — k3s runs natively. Uses `sudo -n` so it works unattended IF
-# passwordless `k3s kubectl` is allowed; otherwise it degrades to an error finding. If your
-# user already has KUBECONFIG set, change K3S_CMD to ["kubectl","get","pods","-A","-o","json"].
-import json, subprocess
-K3S_CMD = ["sudo", "-n", "k3s", "kubectl", "get", "pods", "-A", "-o", "json"]
-def main():
-    try:
-        r = subprocess.run(K3S_CMD, capture_output=True, text=True, timeout=25)
-        if r.returncode != 0:
-            print(json.dumps({"k3s": {"error": (r.stderr or "kubectl failed").strip()[:200]}}))
-            return
-        items = json.loads(r.stdout).get("items", [])
-        pods = [{"name": i.get("metadata", {}).get("name"),
-                 "namespace": i.get("metadata", {}).get("namespace"),
-                 "phase": i.get("status", {}).get("phase")} for i in items]
-        running = sum(1 for p in pods if p["phase"] == "Running")
-        print(json.dumps({"k3s": {"running": running, "total": len(pods), "pods": pods}}))
-    except Exception as e:
-        print(json.dumps({"k3s": {"error": str(e)}}))
-if __name__ == "__main__":
-    main()
-```
+### `collectors/services.py`
 
-### `collectors/usb.py`  (optional; `lsusb`)
 ```python
-# collectors/usb.py (Linux) — USB device count via lsusb (apt install usbutils).
-import json, subprocess
+# collectors/services.py — Linux systemd service state (the `systemctl start xxx` units).
+# Reports running-service count + any FAILED units by name. Runs natively on a Linux host
+# (the Linux release) and, on a Windows host, bridges into WSL — exactly like k3s.py — so a
+# Windows box can still watch the systemd services inside its WSL distro. Degrades cleanly
+# when systemd is reachable nowhere (WSL1, no distro, systemd disabled).
+#
+# Two Windows gotchas this handles: (1) systemctl output is UTF-8 (the '●' status glyph is
+# 0xE2 0x97 0x8F) — we decode utf-8/replace, not the cp1252 locale codec, or a failed unit's
+# bullet crashes the decode. (2) `systemctl list-units` prints a leading '●' column for
+# troubled units — `--plain` drops it so we parse the real unit name.
+import json, os, shutil, subprocess
+
+# a real systemd `is-system-running` answer is one of these; anything else (command-not-found,
+# wsl's UTF-16 "no distribution" banner, empty) means systemd isn't actually reachable here
+VALID = {"running", "degraded", "maintenance", "starting", "stopping", "initializing"}
+
+
+def systemctl_base():
+    if os.name == "posix" and shutil.which("systemctl"):
+        return ["systemctl"]                        # native Linux with systemd
+    # Windows (or no native systemd): try WSL, where modern WSL2 runs systemd if enabled.
+    # ADJUST like k3s.py if your distro isn't the default: prepend ["wsl","-d","Ubuntu",...]
+    if shutil.which("wsl"):
+        return ["wsl", "systemctl"]
+    return None
+
+
+def run(base, *args):
+    r = subprocess.run(base + list(args) + ["--plain", "--no-pager", "--no-legend"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       timeout=20)
+    return r.stdout or ""
+
+
+base = systemctl_base()
 try:
-    out = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=10).stdout
-    print(json.dumps({"usb": {"devices": len([l for l in out.splitlines() if l.strip()]), "problems": 0}}))
+    if not base:
+        print(json.dumps({"services": {"present": False}}))   # no systemd anywhere reachable
+        raise SystemExit
+    probe = subprocess.run(base + ["is-system-running"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=15)
+    status = (probe.stdout or "").strip()
+    if status not in VALID:            # command-not-found / no-distro / WSL1 / systemd disabled
+        print(json.dumps({"services": {"present": False, "note": f"systemd not reachable ({status or 'no answer'})"}}))
+        raise SystemExit
+    running = [ln.split()[0] for ln in run(base, "list-units", "--type=service",
+                                           "--state=running").splitlines() if ln.strip()]
+    failed = [ln.split()[0] for ln in run(base, "list-units", "--type=service",
+                                          "--state=failed").splitlines() if ln.strip()]
+    print(json.dumps({"services": {"present": True, "running": len(running),
+                                   "failed": len(failed), "failed_units": failed,
+                                   "state": status}}))
+except SystemExit:
+    raise
 except Exception as e:
-    print(json.dumps({"usb": {"error": str(e)}}))
+    print(json.dumps({"services": {"error": str(e)}}))
 ```
 
-### `collectors/storage.py`  (optional; `smartctl`, usually needs root)
+### `collectors/ssh.py`
+
 ```python
-# collectors/storage.py (Linux) — drive health via smartctl (apt install smartmontools).
-# SMART usually needs root, so unprivileged this degrades to "unknown"/error.
-import json, subprocess, shutil, glob
+# collectors/ssh.py — scrape components living on remote Linux VMs by SSHing in and running
+# read-only checks (a "check" is a shell command; reading a file is just `cat`/`grep /path`).
+# Shells out to the OpenSSH client (ships with Win10/11 + every Linux) exactly like k3s.py
+# shells to `wsl` — no pip deps. Configure targets in ssh.config.json (see the example);
+# absent config -> present:false, so this collector is a no-op until you set it up.
+#
+# SECURITY (this is a network + auth surface — the defaults are the safe ones):
+#   * KEY-BASED AUTH ONLY. BatchMode=yes disables password prompts (no hangs, no passwords in
+#     a config file). Set up an SSH key to each VM first (ssh-copy-id / authorized_keys).
+#   * HOST KEYS ARE CHECKED. StrictHostKeyChecking stays on; a new VM must be in known_hosts,
+#     or set "accept_new": true per target for trust-on-first-use (accept-new, never "no").
+#   * Point checks at READ-ONLY commands. The collector only reads; what your commands do is
+#     yours to keep read-only.
+#   * One SSH session per target (all its checks run in that one session); targets run in
+#     parallel with per-connect timeouts so an unreachable VM degrades instead of hanging.
+import json, math, os, re, shlex, shutil, subprocess, threading, time
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CONFIG = os.environ.get("WATCHTOWER_SSH_CONFIG", os.path.join(REPO, "ssh.config.json"))
+SSH = shutil.which("ssh")
+# user@host / host; first char alnum/./_ so a value can't start with '-' and pose as an ssh
+# option (e.g. -oProxyCommand=...). Belt-and-suspenders — the config is operator-authored.
+DEST_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]*(@[A-Za-z0-9._][A-Za-z0-9._-]*)?$")
+BUDGET = 20          # wall-clock ceiling for the whole collector, under the 25s parent kill
+PER_TARGET = 14      # per-target ssh cap; < BUDGET so one target can't blow the whole budget
+
+
+def _coerce(s):
+    s = s.strip()
+    if s == "":
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        f = float(s)
+        return f if math.isfinite(f) else s   # keep nan/inf as text -> valid JSON, no fake pass
+    except ValueError:
+        return s
+
+
+def _normalize_checks(raw):
+    """Each check -> {'cmd': str, 'warn'?, 'crit'?, 'unit'?}. Accepts a bare command string
+    or an object with thresholds. Names carrying a tab/newline are dropped — they'd corrupt
+    the name<TAB>value wire format."""
+    out = {}
+    for name, spec in (raw or {}).items():
+        name = str(name)
+        if "\t" in name or "\n" in name:
+            continue
+        if isinstance(spec, str):
+            out[name] = {"cmd": spec}
+        elif isinstance(spec, dict) and isinstance(spec.get("cmd"), str):
+            out[name] = {k: spec[k] for k in ("cmd", "warn", "crit", "unit") if k in spec}
+    return out
+
+
+def _remote_script(checks):
+    # run every check in ONE ssh session; emit "name<TAB>value" per line, each value capped
+    lines = []
+    for name, spec in checks.items():
+        n = shlex.quote(name)
+        # { cmd ; } isolates the operator's command; head -c caps output; tr flattens newlines
+        lines.append(f"printf %s {n}; printf '\\t'; {{ {spec['cmd']} ; }} 2>/dev/null "
+                     f"| head -c 500 | tr '\\n' ' '; printf '\\n'")
+    return " ; ".join(lines)
+
+
+def _scrape(target, connect_timeout):
+    name = str(target.get("name") or target.get("ssh") or "?")
+    # EVERYTHING that can raise on operator-typo'd config lives inside this try, so one bad
+    # target degrades to reachable:false instead of taking down the whole collector.
+    try:
+        dest = target.get("ssh") or target.get("host")
+        checks = _normalize_checks(target.get("checks"))
+        if not dest or not DEST_RE.match(str(dest)):
+            return name, {"reachable": False, "error": "invalid or missing 'ssh' destination"}
+        if not checks:
+            return name, {"reachable": False, "error": "no checks configured"}
+        port = int(target.get("port") or 22)        # '' / None / '22a' -> caught below
+        strict = "accept-new" if target.get("accept_new") else "yes"
+        argv = [SSH, "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+                "-o", f"ConnectTimeout={connect_timeout}",
+                "-o", f"StrictHostKeyChecking={strict}", "-p", str(port)]
+        key = target.get("key")
+        if key:
+            argv += ["-o", "IdentitiesOnly=yes", "-i", os.path.expanduser(str(key))]
+        jump = target.get("jump")                   # optional bastion/ProxyJump
+        if jump and DEST_RE.match(str(jump)):
+            argv += ["-J", str(jump)]
+        argv += [str(dest), _remote_script(checks)]
+        r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=PER_TARGET)
+    except subprocess.TimeoutExpired:
+        return name, {"reachable": False, "error": "timeout"}
+    except Exception as e:
+        return name, {"reachable": False, "error": str(e)[:150]}
+    if r.returncode != 0:
+        return name, {"reachable": False, "error": (r.stderr or "ssh failed").strip()[:150]}
+
+    got = {}
+    for line in r.stdout.splitlines():
+        if "\t" not in line:
+            continue
+        cname, raw = line.split("\t", 1)
+        spec = checks.get(cname, {})
+        entry = {"value": _coerce(raw)}
+        for k in ("warn", "crit", "unit"):
+            if k in spec:
+                entry[k] = spec[k]
+        got[cname] = entry
+    return name, {"reachable": True, "checks": got}
+
+
 def main():
-    sc = shutil.which("smartctl")
-    if not sc:
-        print(json.dumps({"storage": {"error": "smartctl not found (apt install smartmontools)"}}))
+    if not SSH:
+        print(json.dumps({"ssh": {"present": False, "note": "no ssh client on PATH"}}))
         return
-    drives = []
-    for dev in sorted(glob.glob("/dev/nvme[0-9]n1") + glob.glob("/dev/sd[a-z]")):
-        try:
-            out = subprocess.run([sc, "-H", dev], capture_output=True, text=True, timeout=15).stdout
-            health = "PASSED" if "PASSED" in out else ("FAILED" if "FAILED" in out else "unknown")
-            drives.append({"name": dev, "health": health})
-        except Exception:
-            pass
-    print(json.dumps({"storage": {"drives": drives}}))
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        print(json.dumps({"ssh": {"present": False}}))          # unconfigured = no-op
+        return
+    except (json.JSONDecodeError, OSError) as e:
+        print(json.dumps({"ssh": {"error": f"ssh.config.json: {e}"}}))
+        return
+
+    targets = cfg.get("targets") if isinstance(cfg, dict) else None
+    if not isinstance(targets, list) or not targets:
+        print(json.dumps({"ssh": {"present": False}}))
+        return
+    try:
+        ct = max(1, min(int(cfg.get("connect_timeout", 6)), 8))
+    except (TypeError, ValueError):
+        ct = 6
+
+    # daemon workers + a hard wall-clock join deadline: the collector ALWAYS returns within
+    # BUDGET (< the 25s parent kill), even with a hung post-auth check or a large fleet.
+    # Targets not finished by the deadline are reported as budget-exceeded rather than losing
+    # the whole ssh namespace (which is what a parent-timeout kill would do).
+    results, lock, sem = {}, threading.Lock(), threading.Semaphore(24)
+
+    def work(t):
+        with sem:
+            name, r = _scrape(t, ct)
+        with lock:
+            results[name] = r
+
+    threads = [threading.Thread(target=work, args=(t,), daemon=True) for t in targets]
+    deadline = time.monotonic() + BUDGET
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(max(0.0, deadline - time.monotonic()))
+    for t in targets:                               # fill in anything the deadline cut off
+        name = str(t.get("name") or t.get("ssh") or "?")
+        with lock:
+            results.setdefault(name, {"reachable": False, "error": "collector time budget exceeded"})
+    down = sum(1 for r in results.values() if not r.get("reachable"))
+    print(json.dumps({"ssh": {"present": True, "down": down, "targets": results}}))
+
+
 if __name__ == "__main__":
     main()
 ```
 
-> **Windows-only collectors omitted on Linux:** `tpm.py` (Get-Tpm) and `me.py` (Intel ME driver)
-> have no clean Linux equivalent and aren't used by the model or rules — simply don't create
-> them. `sysdiag.py` globs whatever `collectors/*.py` exist, so a smaller set just means fewer
-> keys in the snapshot; nothing breaks.
+### `collectors/_sdr_common.py`
 
-### `sysdiag.py` — aggregator + CLI (identical to Windows)
+```python
+# collectors/_sdr_common.py — shared SDR probe. Underscore prefix = snapshot() skips it
+# (it's a library, not a collector). Used by sdr.py / rx.py / tx.py / tuner.py.
+import json, re, subprocess
+
+# USB signatures of common SDRs; PID None = any product from that vendor.
+KNOWN = {
+    ("0BDA", "2832"): "RTL-SDR (RTL2832U)",
+    ("0BDA", "2838"): "RTL-SDR (RTL2832U)",
+    ("1D50", "6089"): "HackRF One",
+    ("1D50", "60A1"): "Airspy",
+    ("1D50", "6108"): "LimeSDR",
+    ("0456", "B673"): "ADALM-Pluto",
+    ("2500", None):   "Ettus USRP",
+    ("1DF7", None):   "SDRplay RSP",
+}
+
+
+def usb_sdrs():
+    """SDRs visible on USB right now (no SDR libraries needed) -> [labels]."""
+    ps = r"Get-PnpDevice -PresentOnly -EA SilentlyContinue | Select-Object -ExpandProperty InstanceId"
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return []
+    found = []
+    for vid, pid in set(re.findall(r"VID_([0-9A-F]{4})&PID_([0-9A-F]{4})", out, re.I)):
+        label = KNOWN.get((vid.upper(), pid.upper())) or KNOWN.get((vid.upper(), None))
+        if label and label not in found:
+            found.append(label)
+    return found
+
+
+def soapy_devices():
+    """Enumerate via SoapySDR if installed -> [ {driver, label, serial, ...} ] or None."""
+    try:
+        import SoapySDR
+    except ImportError:
+        return None
+    return [dict(kw) for kw in SoapySDR.Device.enumerate()]
+
+
+def absent(namespace):
+    """The degrade contract: hardware not present is a STATE, not an error finding."""
+    print(json.dumps({namespace: {"present": False}}))
+```
+
+### `collectors/sdr.py`
+
+```python
+# collectors/sdr.py — SDR device inventory. SKELETON: runs today (emits present:false
+# with no hardware); fill the FILL-ME blocks when the SDR arrives.
+# Detection is two-layer: USB VID:PID (works with zero SDR software) then SoapySDR
+# enumeration (works for anything with a Soapy driver: rtl-sdr, HackRF, Lime, USRP...).
+import json, os, sys
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)                     # only to reach _sdr_common under python -P...
+from _sdr_common import usb_sdrs, soapy_devices, absent
+sys.path.remove(_here)      # ...then off again, so FILL-ME imports (numpy, SoapySDR -> pyusb
+#                             as `usb`) can never hit our sibling usb.py/power.py
+
+usb = usb_sdrs()
+soapy = soapy_devices()          # None = SoapySDR not installed; [] = installed, none found
+
+if not usb and not soapy:
+    absent("sdr")
+    raise SystemExit
+
+devices = []
+for kw in (soapy or []):
+    dev = {"driver": kw.get("driver"), "label": kw.get("label"), "serial": kw.get("serial"),
+           "rx_channels": None, "tx_channels": None}
+    # FILL-ME(channel counts): opening the device is device-specific and can be slow —
+    # uncomment once you know your hardware behaves:
+    #   import SoapySDR
+    #   sd = SoapySDR.Device(kw)
+    #   dev["rx_channels"] = sd.getNumChannels(SoapySDR.SOAPY_SDR_RX)
+    #   dev["tx_channels"] = sd.getNumChannels(SoapySDR.SOAPY_SDR_TX)
+    #   dev["clock_source"] = sd.getClockSource()
+    devices.append(dev)
+
+print(json.dumps({"sdr": {
+    "present": True,
+    "usb": usb,                          # what the bus sees, even with no drivers installed
+    "soapy_installed": soapy is not None,
+    "devices": devices,
+}}))
+```
+
+### `collectors/rx.py`
+
+```python
+# collectors/rx.py — receive-channel state. SKELETON: emits present:false until the SDR
+# arrives and the FILL-ME block is completed for your hardware.
+#
+# The intended shape per channel — this is what rules.py will threshold on:
+#   {"id": 0, "kind": "wideband"|"narrowband", "freq_hz": ..., "rate_hz": ..., "gain_db": ...,
+#    "power_dbfs": ..., "noise_floor_dbfs": ..., "active": bool}
+#
+# "Is the channel on?" = measured channel power sits above the noise floor by a margin:
+#   active = power_dbfs > noise_floor_dbfs + MARGIN_DB
+# Calibrate MARGIN_DB (start ~6 dB) and the floor against YOUR antenna/environment —
+# the floor is not a constant, sample it with the antenna terminated or at a quiet freq.
+import json, os, sys
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)                     # only to reach _sdr_common under python -P...
+from _sdr_common import usb_sdrs, soapy_devices, absent
+sys.path.remove(_here)      # ...then off again, so FILL-ME imports (numpy, SoapySDR -> pyusb
+#                             as `usb`) can never hit our sibling usb.py/power.py
+
+MARGIN_DB = 6.0   # ponytail: fixed margin; make it per-channel if bands differ a lot
+
+if not usb_sdrs() and not soapy_devices():
+    absent("rx")
+    raise SystemExit
+
+
+def measure_channel(sd, ch):
+    """FILL-ME: read a short burst and compute power. Reference implementation:
+
+    import SoapySDR, numpy as np
+    st = sd.setupStream(SoapySDR.SOAPY_SDR_RX, "CF32", [ch])
+    sd.activateStream(st)
+    buf = np.empty(8192, np.complex64)
+    sr = sd.readStream(st, [buf], len(buf), timeoutUs=int(2e5))
+    sd.deactivateStream(st); sd.closeStream(st)
+    if sr.ret <= 0:
+        return None
+    power = 10 * np.log10(np.mean(np.abs(buf[:sr.ret]) ** 2) + 1e-20)
+    return {
+        "id": ch,
+        "kind": "wideband" if sd.getSampleRate(SoapySDR.SOAPY_SDR_RX, ch) > 2e6 else "narrowband",
+        "freq_hz": sd.getFrequency(SoapySDR.SOAPY_SDR_RX, ch),
+        "rate_hz": sd.getSampleRate(SoapySDR.SOAPY_SDR_RX, ch),
+        "gain_db": sd.getGain(SoapySDR.SOAPY_SDR_RX, ch),
+        "power_dbfs": round(power, 1),
+        "noise_floor_dbfs": NOISE_FLOOR,          # FILL-ME: calibrate, don't hardcode
+        "active": power > NOISE_FLOOR + MARGIN_DB,
+    }
+    """
+    return None
+
+
+channels = []
+# FILL-ME: open each device and measure each Rx channel:
+#   import SoapySDR
+#   for kw in soapy_devices():
+#       sd = SoapySDR.Device(kw)
+#       for ch in range(sd.getNumChannels(SoapySDR.SOAPY_SDR_RX)):
+#           m = measure_channel(sd, ch)
+#           if m: channels.append(m)
+
+print(json.dumps({"rx": {"present": True, "channels": channels,
+                         "note": "skeleton — fill measure_channel() for your SDR"}}))
+```
+
+### `collectors/tx.py`
+
+```python
+# collectors/tx.py — transmit-chain state. SKELETON: emits present:false until filled.
+#
+# Target shape per channel:
+#   {"id": 0, "enabled": bool, "freq_hz": ..., "rate_hz": ..., "gain_db": ...}
+#
+# HONEST LIMIT: most SDRs cannot self-report actual RF power leaving the antenna port —
+# "enabled + configured" is what the API gives you. If you need proof of emission, the
+# two real options are (a) a directional coupler feeding one of your OWN Rx channels
+# (then rx.py's power-above-floor check IS your Tx confirmation), or (b) a hardware
+# power meter. Wire whichever you pick into verify_emission() below.
+import json, os, sys
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)                     # only to reach _sdr_common under python -P...
+from _sdr_common import usb_sdrs, soapy_devices, absent
+sys.path.remove(_here)      # ...then off again, so FILL-ME imports (numpy, SoapySDR -> pyusb
+#                             as `usb`) can never hit our sibling usb.py/power.py
+
+if not usb_sdrs() and not soapy_devices():
+    absent("tx")
+    raise SystemExit
+
+
+def verify_emission(ch):
+    """FILL-ME (optional): loopback/coupler check that Tx RF is actually present."""
+    return None
+
+
+channels = []
+# FILL-ME: enumerate Tx channels and their configured state:
+#   import SoapySDR
+#   for kw in soapy_devices():
+#       sd = SoapySDR.Device(kw)
+#       for ch in range(sd.getNumChannels(SoapySDR.SOAPY_SDR_TX)):
+#           channels.append({
+#               "id": ch,
+#               "freq_hz": sd.getFrequency(SoapySDR.SOAPY_SDR_TX, ch),
+#               "rate_hz": sd.getSampleRate(SoapySDR.SOAPY_SDR_TX, ch),
+#               "gain_db": sd.getGain(SoapySDR.SOAPY_SDR_TX, ch),
+#               "enabled": None,        # device-specific: stream active / PA enabled
+#               "emission_verified": verify_emission(ch),
+#           })
+
+print(json.dumps({"tx": {"present": True, "channels": channels,
+                         "note": "skeleton — fill Tx enumeration for your SDR"}}))
+```
+
+### `collectors/tuner.py`
+
+```python
+# collectors/tuner.py — tuner/frontend state. SKELETON: emits present:false until filled.
+#
+# Target shape per tuner:
+#   {"id": 0, "type": "R820T2"|..., "locked": bool, "ppm": ..., "agc": bool,
+#    "lo_freq_hz": ..., "bandwidth_hz": ...}
+#
+# "locked" = the PLL achieved lock at the requested LO frequency — the tuner-level
+# equivalent of "is this input on". Most drivers surface it as a failed setFrequency /
+# a status flag; rtl-sdr exposes tuner type + PPM directly (librtlsdr get_tuner_type).
+import json, os, sys
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)                     # only to reach _sdr_common under python -P...
+from _sdr_common import usb_sdrs, soapy_devices, absent
+sys.path.remove(_here)      # ...then off again, so FILL-ME imports (numpy, SoapySDR -> pyusb
+#                             as `usb`) can never hit our sibling usb.py/power.py
+
+if not usb_sdrs() and not soapy_devices():
+    absent("tuner")
+    raise SystemExit
+
+tuners = []
+# FILL-ME: per-driver frontend introspection. Soapy generic version:
+#   import SoapySDR
+#   for kw in soapy_devices():
+#       sd = SoapySDR.Device(kw)
+#       for ch in range(sd.getNumChannels(SoapySDR.SOAPY_SDR_RX)):
+#           tuners.append({
+#               "id": ch,
+#               "type": kw.get("tuner") or kw.get("driver"),
+#               "lo_freq_hz": sd.getFrequency(SoapySDR.SOAPY_SDR_RX, ch, "RF"),
+#               "bandwidth_hz": sd.getBandwidth(SoapySDR.SOAPY_SDR_RX, ch),
+#               "agc": bool(sd.getGainMode(SoapySDR.SOAPY_SDR_RX, ch)),
+#               "ppm": sd.getFrequencyCorrection(SoapySDR.SOAPY_SDR_RX, ch),
+#               "locked": None,   # FILL-ME: driver-specific lock/status sensor, e.g.
+#                                 # "lo_locked" in sd.listSensors(SOAPY_SDR_RX, ch)
+#           })
+
+print(json.dumps({"tuner": {"present": True, "tuners": tuners,
+                            "note": "skeleton — fill frontend introspection for your SDR"}}))
+```
+
+### `collectors/antenna.py`
+
+```python
+# collectors/antenna.py — antenna/front-end state per SDR Rx channel. SKELETON: runs today
+# (emits present:false with no SDR), fill the FILL-ME block when the radio + antennas arrive.
+#
+# Distinct from sdr.py (device inventory) and rx.py (channel power): this reports, per
+# channel, WHICH antenna port is selected, the choices available, and — where the hardware
+# exposes it — received signal strength (RSSI) and standing-wave ratio (SWR).
+#
+# HONEST LIMIT on SWR: most receive-only SDRs (RTL-SDR, Airspy, plain HackRF Rx) have NO way
+# to measure SWR — that needs a directional/return-loss bridge on a TX-capable chain (some
+# USRP/Lime setups, or an external VNA/SWR meter). So swr stays null unless your hardware and
+# the FILL-ME wiring actually provide it; RSSI is available on more devices via a Soapy sensor.
+import json, os, sys
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)                     # only to reach _sdr_common under python -P...
+from _sdr_common import usb_sdrs, soapy_devices, absent
+sys.path.remove(_here)      # ...then off again, so FILL-ME imports (numpy, SoapySDR -> pyusb
+#                             as `usb`) can never hit our sibling usb.py/power.py
+
+if not usb_sdrs() and not soapy_devices():
+    absent("antenna")
+    raise SystemExit
+
+antennas = []
+# FILL-ME: enumerate the antenna port per Rx channel + optional RSSI/SWR sensors.
+# Soapy generic version:
+#   import SoapySDR
+#   for kw in soapy_devices():
+#       sd = SoapySDR.Device(kw)
+#       for ch in range(sd.getNumChannels(SoapySDR.SOAPY_SDR_RX)):
+#           sensors = sd.listSensors(SoapySDR.SOAPY_SDR_RX, ch)
+#           rssi = float(sd.readSensor(SoapySDR.SOAPY_SDR_RX, ch, "RSSI")) if "RSSI" in sensors else None
+#           swr = float(sd.readSensor(SoapySDR.SOAPY_SDR_RX, ch, "SWR")) if "SWR" in sensors else None
+#           antennas.append({
+#               "id": ch,
+#               "selected": sd.getAntenna(SoapySDR.SOAPY_SDR_RX, ch),   # e.g. "RX2" / "TX/RX"
+#               "options": list(sd.listAntennas(SoapySDR.SOAPY_SDR_RX, ch)),
+#               "rssi_dbm": rssi,
+#               "swr": swr,                 # null on receive-only radios (no return-loss bridge)
+#           })
+
+print(json.dumps({"antenna": {"present": True, "antennas": antennas,
+                              "note": "skeleton — fill port/RSSI/SWR introspection for your SDR"}}))
+```
+
+### `collectors/lights.py`
+
+```python
+# collectors/lights.py — board/RGB light state via the OpenRGB SDK server (127.0.0.1:6742).
+# Reads every registered RGB device (motherboard, GPU, DRAM, strips) and how many LEDs are
+# actually lit. HONEST LIMIT: POST/EZ-Debug LEDs (CPU/DRAM/VGA/BOOT) are hardware-driven
+# during boot and NOT software-readable — for that failure class see power.py (dirty
+# reboots) and whea.py. RGB state IS still diagnostic: a dead zone = dead header/device.
+# Degrades to a note (not an error) — dark RGB is not a health warning.
+import json
+try:
+    from openrgb import OpenRGBClient
+    c = OpenRGBClient(address="127.0.0.1", port=6742, name="sysdiag")
+    devs = []
+    for d in c.devices:
+        lit = sum(1 for led in d.colors if led.red or led.green or led.blue)
+        devs.append({"name": d.name, "type": d.type.name, "leds": len(d.colors), "lit": lit})
+    c.disconnect()
+    print(json.dumps({"lights": {"devices": devs}}))
+except ImportError:
+    print(json.dumps({"lights": {"note": "openrgb-python not installed (optional)"}}))
+except Exception as e:
+    print(json.dumps({"lights": {"note": f"OpenRGB SDK not reachable: {e}"}}))
+```
+
+### `discover.py` (Linux)
+
+The Windows `discover.py` scans PnP + COM ports. On Linux, replace the `scan_pnp()` body to parse
+`lsusb`/`lspci` (VID:PID) and `/dev/ttyUSB*` / `/dev/ttyACM*` for serial ports; keep the same
+`DEVICE_MAP` / `_sdr_common.KNOWN` mapping and `--spawn` stub logic. The collectors it maps to are
+cross-platform, so only the scan front-end changes.
+
+## 5. Truth-layer aggregator, live sampler, chat brain & UI
+
+These modules are cross-platform — embedded from the real repo files. Only `brain.py`'s system prompt is adapted for Linux (below).
+
+### `sysdiag.py`
+
 ```python
 import json, glob, subprocess, sys, pathlib, argparse
+from concurrent.futures import ThreadPoolExecutor
 HERE = pathlib.Path(__file__).parent
 
 
 def snapshot(only=None) -> dict:
+    """only: None = all collectors, "name" = one, ["a","b"] = a subset (live.py fast tier).
+    An empty list means zero collectors (returns {}), not the full fleet; unknown names in a
+    list are reported once in _errors instead of spawning a doomed subprocess."""
     snap = {}
-    pattern = str(HERE / "collectors" / (f"{only}.py" if only else "*.py"))
-    for f in sorted(glob.glob(pattern)):
-        try:
-            out = subprocess.run([sys.executable, f], capture_output=True, text=True, timeout=25).stdout
-            snap.update(json.loads(out))
-        except Exception as e:
-            snap.setdefault("_errors", []).append(f"{pathlib.Path(f).name}: {e}")
+    if only is not None and not isinstance(only, str):
+        want = [(n, HERE / "collectors" / f"{n}.py") for n in sorted(only)]
+        files = [str(p) for n, p in want if p.exists()]
+        for n, p in want:
+            if not p.exists():
+                snap.setdefault("_errors", []).append(f"{n}: unknown collector")
+    else:
+        pattern = str(HERE / "collectors" / (f"{only}.py" if only else "*.py"))
+        files = sorted(glob.glob(pattern))
+    files = [f for f in files
+             if not pathlib.Path(f).name.startswith("_")]   # _*.py = shared libs, not collectors
+    if not files:
+        return snap
+
+    def run_one(f):
+        # -P keeps collectors/ off the child's sys.path so usb.py/power.py can't shadow pip pkgs
+        return subprocess.run([sys.executable, "-P", f],
+                              capture_output=True, text=True, timeout=25).stdout
+
+    with ThreadPoolExecutor(max_workers=min(8, len(files) or 1)) as ex:
+        for f, fut in [(f, ex.submit(run_one, f)) for f in files]:
+            try:
+                snap.update(json.loads(fut.result()))    # collectors namespace their own keys
+            except Exception as e:
+                snap.setdefault("_errors", []).append(f"{pathlib.Path(f).name}: {e}")
     return snap
 
 
@@ -969,7 +1875,7 @@ def print_findings(snap):
 def narrate():
     import schema, infer
     snap = snapshot()
-    bundle = infer.load()
+    bundle = infer.load()                                   # loads ckpt.pt + vocab.json
     print(infer.generate_report(bundle, schema.serialize_metrics(snap)))
     print("\n--- findings (truth) ---")
     print_findings(snap)
@@ -977,11 +1883,16 @@ def narrate():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", nargs="?", default="diag", help="diag | net | report")
+    ap.add_argument("cmd", nargs="?", default="diag", help="diag | net | report | discover")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-llm", action="store_true")
+    ap.add_argument("--spawn", action="store_true", help="discover: write stub collectors")
     args = ap.parse_args()
 
+    if args.cmd == "discover":
+        import discover
+        discover.main(spawn=args.spawn)
+        return
     if args.cmd == "report" and not args.no_llm:
         narrate()
         return
@@ -996,16 +1907,18 @@ if __name__ == "__main__":
     main()
 ```
 
-### `history.py` — log one snapshot to SQLite (identical to Windows)
+### `history.py`
+
 ```python
-# history.py — append one snapshot to a SQLite history DB. Run on a timer (cron/systemd).
+# history.py — append one snapshot to a SQLite history DB. Run on a timer (Task Scheduler).
+# Same data as `sysdiag --json`, stored as one row: timestamp + the full snapshot JSON.
 import sqlite3, json, time, pathlib
 import sysdiag
 
-DB = pathlib.Path(__file__).parent / "history.db"
+DB = pathlib.Path(__file__).parent / "history.db"   # absolute, so CWD doesn't matter
 
 def main():
-    snap = sysdiag.snapshot()
+    snap = sysdiag.snapshot()                        # runs the collectors (local sensors)
     with sqlite3.connect(DB) as con:
         con.execute("CREATE TABLE IF NOT EXISTS snapshots (ts TEXT, json TEXT)")
         con.execute("INSERT INTO snapshots VALUES (?, ?)",
@@ -1016,209 +1929,295 @@ if __name__ == "__main__":
     main()
 ```
 
-### `system_facts.md` — edit for YOUR machine
-```markdown
-# This machine
+### `live.py`
 
-- CPU: <your CPU> (cores/threads, TjMax). Note what temps are normal under load.
-- GPU: <your GPU>, <VRAM>. Note the edge temp limit and expected load temps.
-- RAM: <size/speed>.
-- Storage: root `/` on <drive>; other mounts.
-- Role: <what this box does> — runs Ollama, maybe Docker/k3s.
-- What I care about: failing components, thermal throttling, MCE hardware errors, disks filling, a fan stalling.
-```
-
----
-
-## 5. The chat brain (Ollama) + UI
-
-### `art.py` — ASCII banner (identical; works in any ANSI terminal)
 ```python
-# art.py — the Watch Tower banner, shared by the CLI (chat.py) and the web UI (app.py).
-import os, shutil
+# live.py — background sampler feeding the GUI's live graphs and the chat brain.
+# Two tiers: FAST collectors every FAST_S seconds, the FULL fleet every FULL_S — so the
+# dashboard stays live without spawning 19 processes (10 of them PowerShell) every tick.
+# In-memory ring buffer only (~1h); long-term history stays with history.py/Task Scheduler.
+#
+# REMOTE mode (WATCHTOWER_REMOTE=1): instead of sampling THIS machine, run an HTTP
+# receiver and let monitored machines push snapshots in (ship.py -> NiFi -> /ingest).
+# Each host gets its OWN ring/snapshot/stamps, keyed by the host name in the payload;
+# the GUI's host selector picks which one the panel/graphs/chat read (see _focus).
+import hmac, json, os, socket, threading, time, collections
+import pandas as pd
+import sysdiag
 
-if os.name == "nt":
-    os.system("")   # enable ANSI in legacy Windows consoles; no-op elsewhere
+REMOTE = os.environ.get("WATCHTOWER_REMOTE") == "1"
+LOCAL_HOST = socket.gethostname()
+FAST_S, FULL_S = 5, 60
+FAST = ["cpu", "gpu", "mem", "sensors", "disk"]     # cheap collectors, safe at 5s cadence
+KEEP = 3600 // FAST_S                               # ~1h of points
 
-LIGHT_BLUE = "\033[38;2;173;216;230m"
-RESET = "\033[0m"
+# Friendly label -> path into the snapshot (superset of trends.METRICS: the deep keys too)
+METRICS = {
+    "CPU temp (C)":     ("sensors", "cpu_temp"),
+    "CPU load (%)":     ("cpu", "load"),
+    "CPU clock (MHz)":  ("cpu", "mhz"),
+    "GPU temp (C)":     ("gpu", "temp"),
+    "GPU power (W)":    ("gpu", "power"),
+    "GPU util (%)":     ("gpu", "util"),
+    "GPU VRAM (%)":     ("gpu", "vram_pct"),
+    "GPU fan (%)":      ("gpu", "fan_pct"),
+    "GPU clock (MHz)":  ("gpu", "sm_mhz"),
+    "Liquid temp (C)":  ("sensors", "liquid_temp"),
+    "Pump (RPM)":       ("sensors", "pump_rpm"),
+    "RAM used (%)":     ("mem", "pct"),
+    "Disk C used (%)":  ("disk", "C"),
+    "Ping (ms)":        ("net", "ping_ms"),
+    "DNS (ms)":         ("net", "dns_ms"),
+    "WHEA errors":      ("whea", "recent_errors"),
+    "VMs running":      ("vm", "running"),
+    "Services failed":  ("services", "failed"),
+    "Services running": ("services", "running"),
+    "SSH targets down": ("ssh", "down"),
+}
+# labels backed by FAST-tier collectors get a fresh point every tick; the rest only when
+# the full fleet runs — recording them per-tick would fake 12 duplicate samples per real one
+FAST_LABELS = {lbl for lbl, path in METRICS.items() if path[0] in FAST}
 
-WATCH_TOWER = """
-██╗    ██╗ █████╗ ████████╗ ██████╗██╗  ██╗    ████████╗ ██████╗ ██╗    ██╗███████╗██████╗
-██║    ██║██╔══██╗╚══██╔══╝██╔════╝██║  ██║    ╚══██╔══╝██╔═══██╗██║    ██║██╔════╝██╔══██╗
-██║ █╗ ██║███████║   ██║   ██║     ███████║       ██║   ██║   ██║██║ █╗ ██║█████╗  ██████╔╝
-██║███╗██║██╔══██║   ██║   ██║     ██╔══██║       ██║   ██║   ██║██║███╗██║██╔══╝  ██╔══██╗
-╚███╔███╔╝██║  ██║   ██║   ╚██████╗██║  ██║       ██║   ╚██████╔╝╚███╔███╔╝███████╗██║  ██║
- ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝       ╚═╝    ╚═════╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═╝
-"""
-
-
-def cli_banner():
-    width = shutil.get_terminal_size((100, 20)).columns
-    print(f"{LIGHT_BLUE}{WATCH_TOWER}\n{'─' * width}{RESET}")
-
-
-def html_banner():
-    return ('<pre style="color:#ADD8E6; line-height:1.05; font-size:11px; '
-            'overflow-x:auto; margin:0; white-space:pre">' + WATCH_TOWER + '</pre>')
-
-
-if __name__ == "__main__":
-    cli_banner()
-```
-> Save as **UTF-8** so the box glyphs survive. Test: `python art.py`.
-
-### `context.py` — grounding context (only the HOMELAB path differs from Windows)
-```python
-import json, pathlib
-import rules
-
-FACTS = pathlib.Path(__file__).parent / "system_facts.md"
-HOMELAB = pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md"  # optional; missing = skipped
-
-HOMELAB_TRIGGERS = ("docker", "container", "homelab", "compose", "traefik", "service",
-                    "service", "service", "service", "service", "grafana", "service",
-                    "k3s", "service", "vpn", "reverse proxy")
-
-
-def _wants_homelab(message: str) -> bool:
-    return any(t in message.lower() for t in HOMELAB_TRIGGERS)
-
-
-def _read(path):
-    try:
-        return path.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
-        return ""
+_lock = threading.Lock()
+_hosts: dict = {}                                   # host name -> per-host state (see _new_host)
+_focus = None                                       # host the panel/graphs/chat currently read
+_thread = None
 
 
-def _snapshot() -> dict:
-    try:
-        import sysdiag
-        return sysdiag.snapshot()
-    except Exception as e:
-        return {"_note": f"truth layer not built ({e}); showing stub.",
-                "cpu": {"load": 0}, "sensors": {"cpu_temp": 0}, "mem": {"pct": 0},
-                "gpu": {"util": 0, "temp": 0, "power": 0, "vram_pct": 0},
-                "disk": {"C": 0}, "whea": {"recent_errors": 0}}
+def _new_host():
+    return {"snap": {}, "stamp": 0.0, "full_stamp": 0.0,
+            "errs": {"fast": [], "full": []}, "buf": collections.deque(maxlen=KEEP)}
 
 
-def snapshot_and_findings():
-    snap = _snapshot()
-    return snap, rules.diagnose(snap)
+def _dig(snap, path):
+    cur = snap
+    for k in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
 
 
-def build(message: str = "") -> str:
-    snap, findings = snapshot_and_findings()
-    parts = [
-        "STATIC FACTS ABOUT THIS MACHINE:",
-        _read(FACTS) or "(no system_facts.md)",
-        "",
-        "LIVE SNAPSHOT (JSON, just collected):",
-        json.dumps(snap, indent=2),
-        "",
-        "FINDINGS (deterministic ground truth from rules.py — trust these over guesses):",
-        json.dumps(findings, indent=2) if findings else "none — all nominal",
-    ]
-    if _wants_homelab(message):
-        homelab = _read(HOMELAB)
-        if homelab:
-            parts += ["", "HOMELAB REFERENCE (HOMELAB-COMPLETE-SETUP.md):", homelab]
-    return "\n".join(parts)
+def _record(fresh, merge, host, extra=None):
+    """Fold one snapshot into `host`'s ring. `merge` True = fast partial (keep prior full-tier
+    keys), False = full replace. `extra` (label/tags from a remote payload) is stamped in."""
+    errs = fresh.pop("_errors", [])
+    now = time.time()
+    with _lock:
+        st = _hosts.get(host) or _hosts.setdefault(host, _new_host())
+        if merge:                                   # fast tier: authoritative for its own errors
+            st["errs"]["fast"] = errs
+            st["snap"] = {**st["snap"], **fresh}
+            labels = FAST_LABELS
+        else:                                       # full fleet: authoritative for everything
+            st["errs"]["fast"], st["errs"]["full"] = [], errs
+            st["snap"] = fresh
+            st["full_stamp"] = now
+            labels = METRICS.keys()
+        st["snap"]["_host"] = host                  # identity is always present, param wins
+        for k, v in (extra or {}).items():
+            st["snap"][k] = v
+        combined = st["errs"]["fast"] + st["errs"]["full"]
+        st["snap"].pop("_errors", None)
+        if combined:
+            st["snap"]["_errors"] = combined
+        st["stamp"] = now
+        st["buf"].append((now, {lbl: _dig(st["snap"], METRICS[lbl]) for lbl in labels}))
 
 
-if __name__ == "__main__":
-    assert _wants_homelab("how's my docker stack?") and not _wants_homelab("is my GPU hot?")
-    print(build())
-```
-
-### `brain.py` — Ollama call (system prompt adapted for Linux/bash/sudo)
-```python
-### brain.py — the chatbot brain. Qwen2.5-32B via Ollama, grounded in the live system state from context.py. READ-ONLY: nothing it returns is ever executed — its output is text shown to a human. ###
-
-import json, urllib.request, urllib.error
-import context
-
-OLLAMA = "http://127.0.0.1:11434/api/chat"
-MODEL = "qwen2.5:32b"            # Q4_K_M by default; ~19GB, fits a 32GB GPU
-
-SYSTEM = """You are a hands-on hardware-diagnostics and troubleshooting expert for THIS
-specific Linux workstation. You answer questions about its health and tell the user EXACTLY what
-to do — as concrete, copy-pasteable steps.
-
-How to answer — ALWAYS:
-- Give numbered, step-by-step instructions. Assume the user copies and runs each step.
-- For EVERY command state all four: (1) the shell — bash; (2) the exact command in a code block;
-  (3) the folder to run it from — give the literal `cd` command when it matters; (4) whether it
-  needs root. If it does, say so first and show it prefixed with `sudo` (or tell them to open a
-  root shell) before that step.
-- End with: what a successful result looks like, and the one thing to check if it fails.
-- Prefer standard Linux tools (systemctl, journalctl, lm-sensors, smartctl, df, free, nvidia-smi)
-  and the user's own `sysdiag` tool. Do NOT invent commands, flags, or file paths. If you're
-  unsure a command exists or is safe, say so instead of guessing.
-- BEFORE any destructive or risky step (deleting files, editing system config, killing processes,
-  anything needing root), put a one-line warning so the user reads it before running.
-
-Hard rules:
-- You only ADVISE. You never run anything — the user runs the steps and decides.
-- The FINDINGS list is deterministic ground truth from a rules engine. Trust it over your own
-  inference; if you disagree with the findings, the findings win.
-- Use the STATIC FACTS to judge what's normal for THIS machine and where things live.
-- Ground every recommendation in the live snapshot + findings below; cite the actual numbers.
-  If the data doesn't show something, say so. Never invent readings, events, or commands.
-
-{ctx}"""
-
-def _text(content):
-    """Ollama's /api/chat needs content as a plain string; Gradio sometimes hands a
-    list of parts (e.g. [{'type':'text','text':...}]) which Ollama 400s on."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
-    return "" if content is None else str(content)
+def _loop():
+    last_full = time.time()                          # start() already took the first full
+    while True:
+        t0 = time.time()
+        try:
+            if t0 - last_full >= FULL_S:
+                _record(sysdiag.snapshot(), merge=False, host=LOCAL_HOST)
+                last_full = t0
+            else:
+                _record(sysdiag.snapshot(only=FAST), merge=True, host=LOCAL_HOST)
+        except Exception:
+            pass    # a transient failure (or interpreter shutdown race) must not kill the
+        #             sampler for the rest of the app's life; the next tick retries
+        time.sleep(max(0.5, FAST_S - (time.time() - t0)))
 
 
-def ask(message, history):
-    """Gradio ChatInterface fn (type='messages'): history is [{role,content}, ...]."""
-    user_text = _text(message)
-    msgs = [{"role": "system", "content": SYSTEM.format(ctx=context.build(user_text))}]
-    msgs += [{"role": m["role"], "content": _text(m.get("content"))} for m in (history or [])]
-    msgs.append({"role": "user", "content": user_text})
-    body = json.dumps({"model": MODEL, "messages": msgs, "stream": False,
-                       "keep_alive": "30m",
-                       "options": {"temperature": 0.3, "num_ctx": 32768}}).encode()
-    req = urllib.request.Request(OLLAMA, data=body,
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=300) as r:
-            return json.loads(r.read())["message"]["content"]
-    except urllib.error.HTTPError as e:
-        return f"(Ollama returned HTTP {e.code}: {e.read().decode(errors='replace')[:300]})"
-    except Exception as e:
-        return f"(couldn't reach Ollama at {OLLAMA}: {e}. Is `ollama` running? Try `ollama ps`.)"
+def start():
+    """Idempotent. Takes one synchronous FULL snapshot so the first paint has data."""
+    global _thread, _focus
+    if _thread and _thread.is_alive():
+        return
+    _record(sysdiag.snapshot(), merge=False, host=LOCAL_HOST)
+    _focus = LOCAL_HOST
+    _thread = threading.Thread(target=_loop, daemon=True, name="live-sampler")
+    _thread.start()
 
 
-def demo():
-    assert _text([{"type": "text", "text": "a"}, {"text": "b"}]) == "ab"
-    assert _text("hi") == "hi" and _text(None) == ""
-    reply = ask("Is anything wrong right now? One sentence.", [])
-    assert isinstance(reply, str) and reply.strip(), "no reply from the brain"
-    print("brain ok:", reply[:160])
+def start_receiver(bind=None, token=None):
+    """REMOTE mode: accept snapshots pushed by ship.py (directly or via NiFi InvokeHTTP).
+    POST /ingest, JSON {host, label?, tags?, partial, snap}; X-Watchtower-Token must match.
+    Each distinct `host` gets its own ring. Merge is per-collector (top-level keys replace
+    wholesale), so a partial payload must carry COMPLETE collector objects — ship.py does."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    bind = bind or os.environ.get("WATCHTOWER_INGEST_BIND", "0.0.0.0:7861")
+    token = token or os.environ.get("WATCHTOWER_TOKEN", "")
+    if not token:
+        raise ValueError("REMOTE mode needs WATCHTOWER_TOKEN set — refusing an open listener")
+    host, port = bind.rsplit(":", 1)
+
+    class Ingest(BaseHTTPRequestHandler):
+        def _reply(self, code, msg=b""):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+
+        def do_POST(self):
+            if self.path != "/ingest":
+                return self._reply(404)
+            try:
+                # header parses are inside the try: a non-ASCII token or non-numeric
+                # Content-Length must return a clean 4xx, not raise + reset the connection
+                got = self.headers.get("X-Watchtower-Token", "")
+                if not hmac.compare_digest(got.encode(), token.encode()):
+                    return self._reply(403)
+                n = int(self.headers.get("Content-Length") or 0)
+                if not 0 < n <= 2_000_000:                   # a snapshot is ~50KB; cap abuse
+                    return self._reply(413)
+                p = json.loads(self.rfile.read(n))
+                snap = p["snap"]
+                if not isinstance(snap, dict):
+                    raise TypeError("snap must be an object")
+            except Exception:
+                return self._reply(400, b"bad payload")
+            reporter = str(p.get("host", "?"))[:64]           # identity of the monitored box
+            extra = {"_label": str(p.get("label", ""))[:128],
+                     "_tags": p.get("tags") if isinstance(p.get("tags"), dict) else {}}
+            _record(snap, merge=bool(p.get("partial")), host=reporter, extra=extra)
+            self._reply(200, b"ok")
+
+        def log_message(self, *_):                            # quiet: 12 req/min/host is not news
+            pass
+
+    srv = ThreadingHTTPServer((host, int(port)), Ingest)
+    threading.Thread(target=srv.serve_forever, daemon=True, name="live-ingest").start()
+    return srv
+
+
+# ---- read side: everything below picks a host (explicit arg, else focus, else the only one) ----
+
+def hosts():
+    """Sorted list of hosts we've received data from (for the GUI selector)."""
+    with _lock:
+        return sorted(_hosts)
+
+
+def set_focus(host):
+    """The host the chat brain answers about (the GUI host selector sets this)."""
+    global _focus
+    if host and host in _hosts:
+        _focus = host
+
+
+def get_focus():
+    return _focus
+
+
+def _resolve(host):
+    if host and host in _hosts:
+        return host
+    if _focus and _focus in _hosts:
+        return _focus
+    hs = sorted(_hosts)
+    return hs[0] if hs else None
+
+
+def get_latest(host=None):
+    """-> (snapshot, fast_age_s, full_age_s) for one host. Empty dict + inf/inf if none."""
+    now = time.time()
+    with _lock:
+        st = _hosts.get(_resolve(host))
+        if not st:
+            return {}, float("inf"), float("inf")
+        return (dict(st["snap"]),
+                now - st["stamp"] if st["stamp"] else float("inf"),
+                now - st["full_stamp"] if st["full_stamp"] else float("inf"))
+
+
+SPANS = {"5 min": 5, "15 min": 15, "60 min": 60}
+
+
+def frame(labels, span="15 min", host=None):
+    """Long-form DataFrame (time, value, series) for one host's metrics — LinePlot food."""
+    cutoff = time.time() - SPANS.get(span, 15) * 60
+    labels = [l for l in (labels or []) if l in METRICS]
+    with _lock:
+        st = _hosts.get(_resolve(host))
+        rows = [(ts, vals) for ts, vals in st["buf"] if ts >= cutoff] if st else []
+    t, v, s = [], [], []
+    for ts, vals in rows:
+        for lbl in labels:
+            if vals.get(lbl) is not None:
+                t.append(ts)
+                v.append(vals[lbl])
+                s.append(lbl)
+    return pd.DataFrame({"time": pd.to_datetime(t, unit="s"), "value": v, "series": s})
+
+
+def deltas(minutes=10, host=None):
+    """Compact per-metric trend text for the LLM: 'CPU temp (C): 45 -> 52 (min 44, max 53)'."""
+    cutoff = time.time() - minutes * 60
+    with _lock:
+        st = _hosts.get(_resolve(host))
+        rows = [vals for ts, vals in st["buf"] if ts >= cutoff] if st else []
+    lines = []
+    for lbl in METRICS:
+        seq = [r[lbl] for r in rows if r.get(lbl) is not None]
+        if len(seq) >= 2 and (min(seq) != max(seq) or seq[0] != seq[-1]):
+            lines.append(f"{lbl}: {seq[0]} -> {seq[-1]} (min {min(seq)}, max {max(seq)}, n={len(seq)})")
+        elif seq:
+            lines.append(f"{lbl}: steady at {seq[-1]} (n={len(seq)})")
+    return "\n".join(lines)
+
+
+def demo():  # the one runnable check: multi-host rings stay separate and frame() shapes them
+    # two synthetic hosts pushed straight in (no network) — rings must not cross-contaminate
+    _record({"cpu": {"load": 10}, "sensors": {"cpu_temp": 40}}, merge=False, host="HOST-A")
+    _record({"cpu": {"load": 90}, "sensors": {"cpu_temp": 80}}, merge=False, host="HOST-B")
+    assert hosts() == ["HOST-A", "HOST-B"], hosts()
+    a, _, _ = get_latest("HOST-A")
+    b, _, _ = get_latest("HOST-B")
+    assert a["sensors"]["cpu_temp"] == 40 and b["sensors"]["cpu_temp"] == 80, "rings crossed"
+    assert a["_host"] == "HOST-A", "host identity missing"
+    set_focus("HOST-B")
+    f, _, _ = get_latest()                       # no arg -> focus
+    assert f["_host"] == "HOST-B", "focus not honoured"
+    df = frame(["CPU load (%)"], "5 min", host="HOST-A")
+    assert list(df.columns) == ["time", "value", "series"] and (df["value"] == 10).all()
+    # and the real local sampler still works end to end
+    _hosts.clear()
+    start()
+    time.sleep(FAST_S + 2)
+    snap, age, full_age = get_latest()
+    assert snap and age < FAST_S + 3 and full_age < FULL_S + 30, (age, full_age)
+    assert snap["_host"] == LOCAL_HOST, "local host identity"
+    print(f"live ok — hosts isolated, focus works, local sampler live ({LOCAL_HOST}, age {age:.1f}s)")
 
 
 if __name__ == "__main__":
     demo()
 ```
 
-### `trends.py` — history → graph DataFrame (identical to Windows)
+### `trends.py`
+
 ```python
 # trends.py — read history.db and return time-series DataFrames for the UI graphs.
+# history.db is filled by the Task Scheduler logger (history.py); this only reads it.
 import json, sqlite3, pathlib, datetime
 import pandas as pd
 
 DB = pathlib.Path(__file__).parent / "history.db"
 
+# Friendly label -> path into a snapshot dict.
 METRICS = {
     "CPU temp (C)":    ("sensors", "cpu_temp"),
     "CPU load (%)":    ("cpu", "load"),
@@ -1232,6 +2231,8 @@ METRICS = {
     "WHEA errors":     ("whea", "recent_errors"),
 }
 
+# How many recent collection runs to plot. Data is run-based (every ~15 min), not
+# continuous, so we select by run count, not calendar range.
 RUNS = {"Last 10 runs": 10, "Last 25 runs": 25, "Last 50 runs": 50,
         "Last 100 runs": 100, "All runs": None}
 
@@ -1252,9 +2253,9 @@ def series(metric, runs_label="Last 25 runs"):
     limit = RUNS.get(runs_label)
     query = "SELECT ts, json FROM snapshots ORDER BY ts DESC"
     if limit:
-        query += f" LIMIT {int(limit)}"
+        query += f" LIMIT {int(limit)}"   # int() guards the f-string against injection
     rows = sqlite3.connect(DB).execute(query).fetchall()
-    rows.reverse()
+    rows.reverse()  # DESC fetch gives newest-first; flip to oldest->newest for the line
     times, values = [], []
     for ts, j in rows:
         try:
@@ -1265,7 +2266,7 @@ def series(metric, runs_label="Last 25 runs"):
             times.append(ts)
             values.append(v)
     t = pd.to_datetime(times)
-    when = [x.strftime("%b %d, %H:%M:%S") for x in t]
+    when = [x.strftime("%b %d, %H:%M:%S") for x in t]  # date + time, shown on hover
     return pd.DataFrame({"time": t, "value": values, "when": when})
 
 
@@ -1275,462 +2276,105 @@ if __name__ == "__main__":
     print(df.tail())
 ```
 
-### `app.py` — Gradio web dashboard (identical to Windows)
+### `context.py`
+
 ```python
-"""app.py — Watch Tower: live stats, chat, and history graphs. READ-ONLY, 127.0.0.1 only."""
-import gradio as gr
-import schema, brain, context, art, trends
+import json, pathlib
+import rules
+import rag
+
+FACTS = pathlib.Path(__file__).parent / "system_facts.md"
 
 
-def stats_md() -> str:
-    snap, findings = context.snapshot_and_findings()
-    head = schema.summarize(snap)
-    lines = [f"### Live\n{head}", "", "### Findings"]
-    if findings:
-        order = {"CRIT": 0, "WARN": 1}
-        for f in sorted(findings, key=lambda x: order.get(x["level"], 9)):
-            lines.append(f"- **[{f['level']}]** {f['what']}: {f['value']}{f['unit']}")
-    else:
-        lines.append("- OK — no findings")
-    d = snap.get("docker", {})
-    if d and "error" not in d:
-        lines.append(f"\n**Docker:** {d.get('running')}/{d.get('total')} running")
-    if "_note" in snap:
-        lines.append(f"\n> {snap['_note']}")
-    return "\n".join(lines)
+def _read(path):
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
 
 
-def plot(metric, rng):
-    return trends.series(metric, rng)
+def _snapshot(host=None) -> dict:
+    # prefer the live sampler's cache (fresh within ~3 ticks) — a chat message then costs
+    # zero collector runs; fall back to a one-shot snapshot when the sampler isn't running
+    # (CLI chat.py, sysdiag report) so behavior there is unchanged. `host` selects which
+    # machine's cache to read (the GUI passes the selected host explicitly, so concurrent
+    # tabs viewing different hosts never clobber each other via a shared global).
+    try:
+        import live
+        snap, age, full_age = live.get_latest(host)
+        # REMOTE mode: the cache is the ONLY truth — falling back to local collectors
+        # would silently describe the monitoring computer instead of the monitored one.
+        if live.REMOTE:
+            if not snap:
+                return {"_note": "remote mode: no snapshots received from the agent yet"}
+            out = {**snap, "_snapshot_age_s": round(min(age, 9999), 1),
+                   "_full_fleet_age_s": round(min(full_age, 9999), 1)}
+            if age > 3 * live.FAST_S:
+                out["_note"] = f"agent stopped shipping {round(age)}s ago — data is STALE"
+            return out
+        if snap and age < 3 * live.FAST_S:
+            return {**snap, "_snapshot_age_s": round(age, 1),
+                    "_full_fleet_age_s": round(min(full_age, 9999), 1)}
+    except Exception:
+        pass
+    try:
+        import sysdiag
+        return sysdiag.snapshot()
+    except Exception as e:
+        return {"_note": f"truth layer not built ({e}); showing stub.",
+                "cpu": {"load": 0}, "sensors": {"cpu_temp": 0}, "mem": {"pct": 0},
+                "gpu": {"util": 0, "temp": 0, "power": 0, "vram_pct": 0},
+                "disk": {"C": 0}, "whea": {"recent_errors": 0}}
 
 
-with gr.Blocks(title="Watch Tower") as app:
-    gr.HTML(art.html_banner())
-    gr.Markdown("# Watch Tower — your system, explained")
-    with gr.Row():
-        with gr.Column(scale=1):
-            panel = gr.Markdown(stats_md())
-            gr.Timer(5).tick(stats_md, outputs=panel)
-        with gr.Column(scale=2):
-            gr.ChatInterface(
-                fn=brain.ask,
-                title="Ask about this machine",
-                examples=["Is anything overheating?",
-                          "What's eating my disk space?",
-                          "Are there any hardware errors?",
-                          "Is my GPU temp normal for this card?"],
-            )
-    gr.Markdown("## History")
-    with gr.Row():
-        metric = gr.Dropdown(list(trends.METRICS), value="CPU temp (C)", label="Component / metric")
-        runs = gr.Dropdown(list(trends.RUNS), value="Last 25 runs", label="Show")
-    graph = gr.LinePlot(trends.series("CPU temp (C)", "Last 25 runs"),
-                        x="time", y="value", tooltip=["when", "value"],
-                        title="History", height=320)
-    metric.change(plot, [metric, runs], graph)
-    runs.change(plot, [metric, runs], graph)
+def snapshot_and_findings(host=None):
+    snap = _snapshot(host)
+    try:
+        return snap, rules.diagnose(snap)
+    except Exception as e:
+        # REMOTE snapshots are semi-trusted JSON from another machine; a malformed field
+        # must not crash the 5s GUI panel / chat. Degrade to a single visible finding.
+        return snap, [{"level": "WARN", "what": "rules engine",
+                       "value": f"could not evaluate snapshot: {e}", "limit": "", "unit": ""}]
 
+
+def build(message: str = "", host=None) -> str:
+    snap, findings = snapshot_and_findings(host)
+    age, full_age = snap.get("_snapshot_age_s"), snap.get("_full_fleet_age_s")
+    label = ("LIVE SNAPSHOT (JSON, just collected):" if age is None else
+             f"LIVE SNAPSHOT (JSON; fast metrics ~{age}s old, "
+             f"full fleet — net/docker/whea/power/storage — ~{full_age}s old):")
+    parts = [
+        "STATIC FACTS ABOUT THIS MACHINE:",
+        _read(FACTS) or "(no system_facts.md)",
+        "",
+        label,
+        json.dumps(snap, indent=2),
+        "",
+        "FINDINGS (deterministic ground truth from rules.py — trust these over guesses):",
+        json.dumps(findings, indent=2) if findings else "none — all nominal",
+    ]
+    try:                                   # live trend digest, when the sampler is running
+        import live
+        trend = live.deltas(host=host)
+        if trend:
+            parts += ["", "RECENT TRENDS (live-sampled, last 10 min):", trend]
+    except Exception:
+        pass
+    refs = rag.context_block(message)      # semantic retrieval replaces the keyword gate
+    if refs:
+        parts += ["", refs]
+    return "\n".join(parts)
 
 if __name__ == "__main__":
-    art.cli_banner()
-    try:
-        app.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True)
-    finally:
-        import subprocess  # free the model's VRAM on clean exit (Ctrl+C)
-        subprocess.run(["ollama", "stop", brain.MODEL], check=False)
+    out = build("how is my reverse proxy set up?")
+    assert "FINDINGS" in out, "context block lost its findings"
+    print(out[:800])
 ```
 
-### `chat.py` — CLI chat (identical to Windows)
+### `rag.py`
+
 ```python
-# chat.py — Watch Tower from the command line. Same model + live system context as the web UI.
-import art, brain
-
-PROMPT = "\033[38;2;173;216;230m❯\033[0m "   # light-blue prompt to match the banner
-
-
-def main():
-    art.cli_banner()
-    print("Ask about this machine. Type 'exit' or Ctrl+C to quit.\n")
-    history = []
-    while True:
-        try:
-            msg = input(PROMPT)
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if msg.strip().lower() in ("exit", "quit"):
-            break
-        if not msg.strip():
-            continue
-        reply = brain.ask(msg, history)
-        print(f"\n{reply}\n")
-        history += [{"role": "user", "content": msg},
-                    {"role": "assistant", "content": reply}]
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        import subprocess  # free the model's VRAM on exit
-        subprocess.run(["ollama", "stop", brain.MODEL], check=False)
-```
-
-### `.gitignore`
-```gitignore
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-ckpt.pt
-*.pt
-*.safetensors
-history.db
-*.db-journal
-.env
-.env.*
-.DS_Store
-```
-
-### `requirements.txt`
-```
-torch
-gradio
-pandas
-psutil
-```
-
----
-
-## 6. Build it — step by step (with expected output)
-
-All commands run from `~/sysdiag`.
-
-### 6.1 Virtual env + dependencies
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-# torch for your CUDA (cu128 = CUDA 12.8; pick yours from pytorch.org). CPU-only? drop --index-url.
-pip install torch --index-url https://download.pytorch.org/whl/cu128
-pip install gradio pandas psutil
-```
-Confirm:
-```bash
-python -c "import torch,gradio,pandas,psutil; print('torch',torch.__version__,'cuda',torch.cuda.is_available()); print('gradio',gradio.__version__,'pandas',pandas.__version__)"
-```
-Expected:
-```
-torch 2.11.0+cu128 cuda True
-gradio 6.19.0 pandas 3.0.3
-```
-
-### 6.2 Sanity-check pure-logic modules
-```bash
-python schema.py
-python rules.py
-python collectors/docker.py --test
-```
-Expected:
-```
-schema ok
-rules ok
-docker parsers ok
-```
-
-### 6.3 Generate the corpus
-```bash
-python data.py 8000
-```
-Expected:
-```
-wrote corpus.txt: 8000 docs, 2,055,944 chars, 80 unique chars, ~3900 with alerts
---- sample document ---
-INPUT
-cpu_load=70 cpu_temp=80 mem_pct=56
-gpu_util=73 gpu_temp=67 gpu_power=209 gpu_vram=45
-disk_C=69 whea_errors=0
-REPORT
-OK: Everything looks healthy. CPU 70% / 80C, GPU 73% / 67C / 209W, RAM 56%, disk C 69%. Continue normal operation.
-```
-
-### 6.4 Train the tiny GPT
-```bash
-python train.py
-```
-Expected (representative — exact losses vary; ~2-5 min on a CUDA GPU):
-```
-device=cuda dtype=torch.bfloat16 vocab=80 tokens(train/val)=1,850,349/205,595
-model params: 10.79M
-iter     0 | train 4.4xxx | val 4.4xxx | lr 2.00e-06
-   sample: <gibberish at first>
-...
-iter  3000 | train 0.2xxx | val 0.2xxx | lr 3.00e-05
-   sample: WARNING: One subsystem is running warm. ... CPU temp is elevated at 94C (limit 90C).
-saved ckpt.pt + vocab.json
-```
-Writes `ckpt.pt` (~44 MB) + `vocab.json`.
-
-### 6.5 Test the trained model
-```bash
-python infer.py --demo
-```
-Expected: an `INPUT`, a rule-based `GROUND TRUTH`, and a `MODEL OUTPUT` that closely matches it.
-
-### 6.6 Run the live collectors
-```bash
-python collectors/cpu.py
-python collectors/gpu.py
-python collectors/sensors.py
-python collectors/disk.py
-python sysdiag.py
-```
-Expected (yours reflect your hardware; note `disk` root shown as `C`):
-```
-{"cpu": {"cores": 24, "logical": 32, "load": 6}}
-{"gpu": {"util": 1, "temp": 36, "power": 57, "vram_pct": 11}}
-{"sensors": {"cpu_temp": 41, "fans": {"coretemp:fan1": 900}}}
-{"disk": {"C": 47, "/home": 62}}
-[WARN] RAM: 87% (limit 85%)
-```
-> If `sensors` shows `cpu_temp: null`, lm-sensors didn't find a package sensor — run
-> `sudo sensors-detect --auto` and `sensors` to confirm, then adjust the chip names in
-> `collectors/sensors.py` if needed.
-
-### 6.7 Full snapshot JSON
-```bash
-python sysdiag.py diag --json
-```
-Expected: a pretty-printed JSON object with `cpu`, `mem`, `disk`, `gpu`, `sensors`, `net`,
-`whea`, (and `docker`/`k3s` if present). This is what `context.py` feeds the chat model.
-
----
-
-## 7. Connect Ollama (the 32B chat model)
-
-```bash
-curl -fsSL https://ollama.com/install.sh | sh   # installs + starts the ollama systemd service
-ollama pull qwen2.5:32b                          # ~19 GB
-ollama run qwen2.5:32b "say OK"                  # expect: OK
-ollama ps
-```
-Expected `ollama ps`:
-```
-NAME           ID    SIZE     PROCESSOR    CONTEXT    UNTIL
-qwen2.5:32b    ...   28 GB    100% GPU     32768      30 minutes from now
-```
-> Same VRAM math as Windows: KV cache ≈ 256 KB/token (~8 GB at 32k); ~19 GB model + 8 GB ≈ 28 GB,
-> fits a 32 GB GPU. Smaller GPU → set `num_ctx` to `16384`/`8192` in `brain.py`. `keep_alive: 30m`
-> keeps it warm; `app.py`/`chat.py` `ollama stop` on clean exit.
-
-Smoke-test:
-```bash
-python brain.py
-```
-Expected: `brain ok: <a real sentence about your machine's current state>`
-
-### Choosing the chat model — US-built open-weight options
-
-`brain.py` sets `MODEL = "qwen2.5:32b"` — a strong default, but Qwen is built by Alibaba (China).
-To run a **US-built** model instead, `ollama pull <tag>` one of the open-weight families below, then
-set `MODEL` to that tag and re-check `num_ctx` against your VRAM. They all run the same way through
-Ollama; no other code changes.
-
-> VRAM figures are **approximate**, at Ollama's default **Q4_K_M** quant, and cover the *weights
-> only* — add KV cache for your `num_ctx` (~256 KB/token for a 32B; less for smaller models). If a
-> model doesn't fit VRAM, Ollama spills layers to system RAM: slower, but it still runs. Tags and
-> context lengths change over time — confirm with `ollama show <tag>` and the model card.
-
-| Model (US company) | `ollama pull` tag | Params | Context | ~VRAM @ Q4 | Notes |
-|---|---|---|---|---|---|
-| Llama 3.2 (Meta) | `llama3.2:1b` · `:3b` | 1B · 3B | 128K | ~1 · ~2.5 GB | edge / CPU-friendly |
-| Llama 3.1 (Meta) | `llama3.1:8b` | 8B | 128K | ~6 GB | best small all-rounder |
-| Llama 3.3 (Meta) | `llama3.3:70b` | 70B | 128K | ~42 GB | ~405B quality at 70B |
-| Llama 3.1 (Meta) | `llama3.1:70b` · `:405b` | 70B · 405B | 128K | ~42 · ~230 GB | 405B = multi-GPU / server |
-| Llama 4 Scout (Meta) | `llama4:scout` | 109B MoE / 17B active | up to 10M | ~65 GB | MoE; very long context |
-| Llama 4 Maverick (Meta) | `llama4:maverick` | 400B MoE / 17B active | 1M | ~240 GB | server / multi-GPU |
-| Gemma 3 (Google) | `gemma3:1b·4b·12b·27b` | 1–27B | 128K (1B: 32K) | ~1 · ~3 · ~8 · ~17 GB | vision on 4B+; excellent |
-| Gemma 2 (Google) | `gemma2:2b·9b·27b` | 2–27B | 8K | ~2 · ~6 · ~16 GB | older, short context |
-| Phi-4 (Microsoft) | `phi4` | 14B | 16K | ~9 GB | strong reasoning per GB |
-| Phi-4-mini (Microsoft) | `phi4-mini` | 3.8B | 128K | ~3 GB | small + long context |
-| gpt-oss (OpenAI) | `gpt-oss:20b` · `:120b` | 21B · 117B MoE | 128K | ~14 · ~65 GB | OpenAI's open-weight reasoning models (MXFP4) |
-| Nemotron (NVIDIA) | `nemotron:70b` | 70B | 128K | ~42 GB | NVIDIA-tuned Llama-3.1, RLHF |
-| Nemotron-mini (NVIDIA) | `nemotron-mini:4b` | 4B | 4K | ~3 GB | on-device |
-| Granite 3.3 (IBM) | `granite3.3:2b` · `:8b` | 2B · 8B | 128K | ~2 · ~5 GB | enterprise, tool-use |
-| OLMo 2 (Allen AI) | `olmo2:7b` · `:13b` | 7B · 13B | 4K | ~5 · ~8 GB | fully open (data + weights) |
-| DBRX (Databricks) | `dbrx` | 132B MoE / 36B active | 32K | ~80 GB | server-class MoE |
-
-> **Not open-weight (can't `ollama pull`):** Anthropic Claude and OpenAI's flagship GPT are
-> API-only — OpenAI's open release is **gpt-oss** (above). xAI published Grok-1 weights, but at 314B
-> they're impractical here. Mistral/Mixtral (France), Qwen/DeepSeek (China), Command-R (Cohere,
-> Canada) and Falcon (UAE) are excluded as non-US.
-
-**Pick by capability:**
-
-- **If hardware is no object** (≥48 GB VRAM, or multi-GPU / server): `llama3.1:405b` or
-  `llama4:maverick` for frontier quality; **`llama3.3:70b`** or **`nemotron:70b`** as the best
-  practical 70B; **`gpt-oss:120b`** for OpenAI-style reasoning; `dbrx` for a fast MoE. On a single
-  ~32 GB GPU the strongest US options are **`gpt-oss:20b`**, **`gemma3:27b`**, or **`phi4`**.
-- **If hardware is constrained** (8–16 GB VRAM, or CPU-only): **`llama3.1:8b`** or
-  **`granite3.3:8b`** (8 GB class); **`gemma3:12b`** / **`phi4`** at ~12 GB; **`llama3.2:3b`** /
-  **`gemma3:4b`** / **`phi4-mini`** for CPU-only or ≤8 GB. Keep `num_ctx` at `8192`–`16384` so the
-  KV cache fits beside the weights.
-
-Sizing rule: **weights (≈ the table's VRAM) + KV cache (`num_ctx`) ≤ your VRAM**, else lower
-`num_ctx` in `brain.py` or accept CPU spillover. After pulling, set `MODEL = "<tag>"` and restart
-`app.py` / `chat.py`.
-
----
-
-## 8. Run it
-
-```bash
-python chat.py     # CLI: banner + ❯ prompt; ask "Is my GPU temp normal?"; 'exit' to quit
-python app.py      # web: opens http://127.0.0.1:7860
-```
-Expected `app.py` console:
-```
-<light-blue WATCH TOWER banner>
-* Running on local URL:  http://127.0.0.1:7860
-```
-Ctrl+C stops it (and frees VRAM). After editing any `.py`, **restart `app.py`** — Gradio caches
-the loaded modules.
-
----
-
-## 9. Schedule history logging (the graph's data)
-
-Fill `history.db` every ~15 min. Easiest is **cron**:
-```bash
-crontab -e
-# add this line (absolute paths; venv python):
-*/15 * * * * cd ~/sysdiag && ~/sysdiag/.venv/bin/python history.py >> ~/sysdiag/history.log 2>&1
-```
-Or a **systemd timer** (`~/.config/systemd/user/watchtower.service` + `.timer`, then
-`systemctl --user enable --now watchtower.timer`).
-
-Verify one manual run:
-```bash
-python history.py
-```
-Expected:
-```
-logged 21:22:15
-```
-After a few runs the History graph fills in; pick a metric + "Last N runs" and **hover** a point
-for its date + time.
-
----
-
-## 10. The ASCII art / banner (recap)
-
-- `art.py` is the banner — light-blue truecolor (`\033[38;2;173;216;230m`), used by `chat.py`
-  (`cli_banner()`) and `app.py` (`html_banner()`). Save as UTF-8 so the box glyphs survive
-  (`python art.py` to test). The `os.name == "nt"` check is a no-op on Linux.
-- The web banner is the same art in a `<pre>`, injected via `gr.HTML(art.html_banner())`.
-
----
-
-## 11. Final layout
-
-```
-sysdiag/
-├─ .gitignore  requirements.txt
-├─ schema.py rules.py data.py gpt.py train.py infer.py   # tiny GPT (identical to Windows)
-├─ sysdiag.py history.py                                 # truth layer + logger
-├─ context.py brain.py rag.py                            # Ollama chat brain + RAG (Linux-tuned prompt/path)
-├─ art.py trends.py app.py chat.py                       # UI/CLI (identical to Windows)
-├─ system_facts.md
-├─ collectors/
-│   └─ cpu.py mem.py disk.py gpu.py sensors.py net.py whea.py docker.py k3s.py usb.py storage.py
-├─ corpus.txt   vocab.json   ckpt.pt   history.db   rag_index.db   # generated (ckpt/history/rag_index git-ignored)
-```
-
-## 12. Troubleshooting
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `(Ollama returned HTTP 400: cannot unmarshal array … into string)` | Gradio sent list-shaped content | `_text()` in `brain.py` — already included |
-| Chat replies **one word** then stops | prompt filled `num_ctx`, no room to generate | keep retrieval lean (lower `TOP_K` / raise `MIN_SCORE` in `rag.py`); keep `num_ctx` ≥ prompt + reply |
-| `(couldn't reach Ollama …)` | service down / model not pulled | `systemctl status ollama`, `ollama pull qwen2.5:32b` |
-| `sensors: cpu_temp null` | lm-sensors not configured | `sudo sensors-detect --auto`; adjust chip names in `sensors.py` |
-| `whea` always 0 | `journalctl -k` needs perms, or genuinely no MCEs | add user to `systemd-journal` group (0 is the healthy case) |
-| `cuda False` | torch CPU build / driver | install the CUDA `torch` wheel matching `nvidia-smi` |
-| `docker not found` / k3s error | not installed or no perms | optional collectors — ignore, or add user to `docker` group / allow passwordless `k3s kubectl` |
-| Edited a file, app unchanged | Gradio cached the module | restart `app.py` |
-
----
-
-## 13. Add a local RAG pipeline (semantic doc retrieval)
-
-Everything above gives the chat brain a *live* picture of the machine (snapshot + findings) plus a
-single static `system_facts.md`. **RAG** adds a *reference library*: point it at any Markdown docs —
-homelab notes, hardware manuals, scraped wikis (PowerShell/Arch/Linux), runbooks — and the model
-gets only the few paragraphs actually relevant to each question, pulled by semantic similarity,
-instead of being fed (or not fed) a whole document by a keyword gate.
-
-It stays true to the rest of Watch Tower: **local-only, read-only** (it only SELECTS text to show
-the model), and degrades to silence if Ollama is down. It adds **one file** (`rag.py`), edits
-**one** (`context.py`), and `brain.py` does **not** change. Run every command from the project
-root (`sysdiag/`), where `rag.py` lives.
-
-> Built to scale: this version embeds in **batches** and indexes **incrementally**, so a large
-> corpus (tens of thousands of chunks) builds in minutes and editing one doc re-embeds only that
-> doc. The mechanics are in **§13.6**.
-
-### 13.1 Pull an embedding model
-
-Retrieval needs a real *embedding* model (chat models like `qwen2.5:32b` return an empty vector
-from the embeddings endpoint — they have no embedding head). The default is `nomic-embed-text`:
-
-```bash
-ollama pull nomic-embed-text
-```
-Expected (~274 MB, runs fine on CPU — no VRAM needed):
-```
-pulling manifest
-pulling ... 100% ▕████████████████▏ 274 MB
-verifying sha256 digest
-success
-```
-
-US-built embedding models you can use instead (set `EMBED_MODEL` in `rag.py`):
-
-| Embedder (US company) | `ollama pull` tag | Dim | Context | Size | Notes |
-|---|---|---|---|---|---|
-| nomic-embed-text (Nomic AI) | `nomic-embed-text` | 768 | 8192 | 274 MB | **default**; wants the `search_document:` / `search_query:` prefixes (already in `rag.py`) |
-| snowflake-arctic-embed (Snowflake) | `snowflake-arctic-embed` · `:137m` · `:33m` | 1024 / 768 | 512 | 70–670 MB | strong English retrieval |
-| snowflake-arctic-embed2 (Snowflake) | `snowflake-arctic-embed2` | 1024 | 8192 | 1.2 GB | multilingual + long context |
-| granite-embedding (IBM) | `granite-embedding:30m` · `:278m` | 384 / 768 | 512 | 60 / 560 MB | enterprise |
-
-> Non-US embedders you'll see in Ollama: `all-minilm` (sentence-transformers, Germany),
-> `mxbai-embed-large` (Mixedbread, Germany) and `bge-*` (BAAI, China) — fine technically,
-> excluded here as non-US. If you switch embedder, set
-> `EMBED_MODEL`, adjust `DOC_PREFIX`/`QUERY_PREFIX` per its model card, and rebuild with
-> `python rag.py --build --force`.
-
-### 13.2 The vector store (sqlite-vec)
-
-`rag.py` stores embeddings in **sqlite-vec** — a vector-search extension for the same SQLite you
-already use for `history.db`. It's already in `requirements.txt`:
-
-```bash
-pip install sqlite-vec
-```
-sqlite-vec loads as a SQLite extension, which needs your Python's `sqlite3` built with extension
-loading enabled. Confirm:
-```bash
-python -c "import sqlite3; sqlite3.connect(':memory:').enable_load_extension(True); print('OK')"
-```
-Expected: `OK`. (Most distro and python.org builds support it. A minimal/static build that raises
-here would need `sqlite3` rebuilt with extension loading enabled.)
-
-### 13.3 Create `rag.py`
-
-Paste this into the project root. It is self-contained and self-tests with `python rag.py`. (The
-listing is wrapped in a four-backtick fence because the code itself contains triple-backticks.)
-
-````python
 # rag.py — local RAG for Watch Tower. Makes your reference docs (homelab notes, hardware manuals,
 # runbooks, scraped wikis) searchable so the chat model can quote the RIGHT few paragraphs instead
 # of being fed a whole document. Embeddings come from Ollama's local embedding model; retrieval is
@@ -2039,153 +2683,757 @@ if __name__ == "__main__":
             print(f"{score:.3f}  [{src}] {txt[:90].strip()}")
     else:
         demo()
-````
-
-Drop any `.md` you want searchable into the project folder — `SOURCES` globs every `*.md` in it
-automatically, plus your homelab notes. Offline self-test (no Ollama needed for the asserts):
-
-```bash
-python rag.py
-```
-Expected before you've built the index:
-```
-rag chunk/math ok
-(index not built yet — run `python rag.py --build` to embed 20 docs)
 ```
 
-### 13.4 Wire it into `context.py`
+### `art.py`
 
-`context.build(message)` already produces the `{ctx}` string in `brain.SYSTEM`. RAG replaces the
-old keyword gate (`_wants_homelab` / whole-doc dump) with semantic retrieval.
-
-**13.4a** — add the import at the top of `context.py`:
 ```python
-import json, pathlib
-import rules
-import rag                      # NEW
-```
-**13.4b** — append retrieved chunks at the end of `build()`:
-```python
-def build(message: str = "") -> str:
-    snap, findings = snapshot_and_findings()
-    parts = [
-        "STATIC FACTS ABOUT THIS MACHINE:",
-        _read(FACTS) or "(no system_facts.md)",
-        "",
-        "LIVE SNAPSHOT (JSON, just collected):",
-        json.dumps(snap, indent=2),
-        "",
-        "FINDINGS (deterministic ground truth from rules.py — trust these over guesses):",
-        json.dumps(findings, indent=2) if findings else "none — all nominal",
-    ]
-    refs = rag.context_block(message)      # semantic retrieval replaces the keyword gate
-    if refs:
-        parts += ["", refs]
-    return "\n".join(parts)
-```
-**13.4c** — delete the now-dead keyword gate (`HOMELAB`, `HOMELAB_TRIGGERS`, `_wants_homelab`) and
-move that doc path into `rag.SOURCES` (it's already covered by the `*.md` glob if the doc lives in
-the project folder). Update the `__main__` self-test:
-```python
+# art.py — the Watch Tower banner, shared by the CLI (chat.py) and the web UI (app.py).
+import os, shutil
+
+if os.name == "nt":
+    os.system("")   # enable ANSI in legacy Windows consoles; no-op in Windows Terminal
+
+LIGHT_BLUE = "\033[38;2;173;216;230m"
+RESET = "\033[0m"
+
+WATCH_TOWER = """
+██╗    ██╗ █████╗ ████████╗ ██████╗██╗  ██╗    ████████╗ ██████╗ ██╗    ██╗███████╗██████╗
+██║    ██║██╔══██╗╚══██╔══╝██╔════╝██║  ██║    ╚══██╔══╝██╔═══██╗██║    ██║██╔════╝██╔══██╗
+██║ █╗ ██║███████║   ██║   ██║     ███████║       ██║   ██║   ██║██║ █╗ ██║█████╗  ██████╔╝
+██║███╗██║██╔══██║   ██║   ██║     ██╔══██║       ██║   ██║   ██║██║███╗██║██╔══╝  ██╔══██╗
+╚███╔███╔╝██║  ██║   ██║   ╚██████╗██║  ██║       ██║   ╚██████╔╝╚███╔███╔╝███████╗██║  ██║
+ ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝       ╚═╝    ╚═════╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═╝
+"""
+
+
+def cli_banner():
+    """Print the banner in light blue with a full-width rule under it (terminal)."""
+    width = shutil.get_terminal_size((100, 20)).columns
+    try:
+        print(f"{LIGHT_BLUE}{WATCH_TOWER}\n{'─' * width}{RESET}")
+    except UnicodeEncodeError:      # redirected/cp1252 stdout can't draw box glyphs —
+        print("WATCH TOWER")        # a cosmetic banner must never kill the app
+
+
+def html_banner():
+    """Return the banner as HTML for Gradio: monospace <pre>, light blue, scrolls if narrow."""
+    return ('<pre style="color:#ADD8E6; line-height:1.05; font-size:11px; '
+            'overflow-x:auto; margin:0; white-space:pre">' + WATCH_TOWER + '</pre>')
+
+
 if __name__ == "__main__":
-    out = build("how is my reverse proxy set up?")
-    assert "FINDINGS" in out, "context block lost its findings"
-    print(out[:800])
+    cli_banner()
 ```
-`brain.py` is unchanged — it calls `context.build(user_text)` and passes the whole grounded string
-as the system prompt.
 
-### 13.5 Build the index
+### `app.py`
 
-From the project root (`sysdiag/`), with Ollama running and `nomic-embed-text` pulled:
+```python
+"""app.py — Watch Tower: live stats, chat, and history graphs. READ-ONLY, 127.0.0.1 only."""
+import gradio as gr
+import schema, brain, context, art, trends, live
+
+if gr.NO_RELOAD:   # guard: `gradio app.py` reload mode re-imports modules — without this,
+    #              every source edit would leak one more immortal sampler thread.
+    if live.REMOTE:
+        live.start_receiver()   # monitoring another machine: data arrives via ship.py/NiFi
+    else:
+        live.start()            # monitoring THIS machine: local two-tier sampler
+#                Background sampler: fast metrics every 5s, full fleet every 60s. The stats
+#                panel, live graphs AND the chat brain all read its cache — nothing in the
+#                UI spawns the collector fleet per tick anymore.
+
+
+WAITING = "(waiting for data)"
+
+
+def refresh_hosts(current):
+    """Keep the host selector's choices current and point the chat at the visible host.
+    In local mode this is a single host; in remote mode new agents appear here live."""
+    hs = live.hosts()
+    if not hs:
+        return gr.update(choices=[WAITING], value=WAITING)
+    val = current if current in hs else hs[0]
+    live.set_focus(val)                     # the chat brain answers about the selected host
+    return gr.update(choices=hs, value=val)
+
+
+def stats_md(host) -> str:
+    live.set_focus(host)                    # default for the host=None fallback path (CLI chat)
+    snap, findings = context.snapshot_and_findings(host)   # explicit host: no cross-tab clobber
+    head = schema.summarize(snap)
+    ident = snap.get("_host", host)
+    label = snap.get("_label")
+    age = snap.get("_snapshot_age_s")
+    fresh = f" *(sampled {age}s ago)*" if age is not None else ""
+    title = f"### {ident}" + (f" — {label}" if label else "") + fresh
+    lines = [f"{title}\n{head}", "", "### Findings"]
+    if findings:
+        order = {"CRIT": 0, "WARN": 1}
+        for f in sorted(findings, key=lambda x: order.get(x["level"], 9)):
+            lines.append(f"- **[{f['level']}]** {f['what']}: {f['value']}{f['unit']}")
+    else:
+        lines.append("- OK — no findings")
+    d = snap.get("docker", {})
+    if d and "error" not in d:
+        lines.append(f"\n**Docker:** {d.get('running')}/{d.get('total')} running")
+    tags = snap.get("_tags")
+    if isinstance(tags, dict) and tags:
+        lines.append("\n" + " · ".join(f"`{k}={v}`" for k, v in tags.items()))
+    if "_note" in snap:
+        lines.append(f"\n> {snap['_note']}")
+    return "\n".join(lines)
+
+
+def plot(metric, rng):
+    return trends.series(metric, rng)
+
+
+_init_hosts = live.hosts()
+_init_host = _init_hosts[0] if _init_hosts else WAITING
+
+
+def live_plot_component(sel, span, host):
+    # return a FULL component, not a bare DataFrame: the plot frontend freezes its
+    # series/color encoding from the first value it receives, so bare-value updates
+    # silently drop any series that wasn't present at page load (e.g. everything,
+    # when the page loads seconds after app start). Rebuilding the component each
+    # tick re-derives the encoding, so new series appear live.
+    return gr.LinePlot(live.frame(sel, span, host=host), x="time", y="value", color="series",
+                       title="Live (5s fast tier; net/whea/vm/services every 60s)", height=320)
+
+
+DEFAULT_SEL = ["CPU temp (C)", "GPU temp (C)", "Liquid temp (C)"]
+
+with gr.Blocks(title="Watch Tower") as app:
+    gr.HTML(art.html_banner())
+    gr.Markdown("# Watch Tower — your system, explained")
+    host_sel = gr.Dropdown(_init_hosts or [WAITING], value=_init_host, label="Host",
+                           info="which monitored machine to view (local mode: just this one)")
+    with gr.Row():
+        with gr.Column(scale=1):
+            panel = gr.Markdown(stats_md(_init_host))
+            gr.Timer(5).tick(refresh_hosts, inputs=host_sel, outputs=host_sel)
+            gr.Timer(5).tick(stats_md, inputs=host_sel, outputs=panel)
+        with gr.Column(scale=2):
+            gr.ChatInterface(
+                fn=brain.ask,
+                additional_inputs=[host_sel],   # the selected host reaches brain.ask -> context,
+                #                                 so the chat answers about the host you're viewing
+                title="Ask about the selected host",
+                # list-of-lists (message + each additional input) is required once
+                # additional_inputs is set; host is left to default per example
+                examples=[["Is anything overheating?"],
+                          ["What's eating my disk space?"],
+                          ["Are there any hardware errors?"],
+                          ["Any failed services or stopped VMs?"]],
+            )
+    gr.Markdown("## Live graphs")
+    with gr.Row():
+        live_sel = gr.Dropdown(list(live.METRICS), multiselect=True, label="Metrics",
+                               value=DEFAULT_SEL)
+        live_span = gr.Dropdown(list(live.SPANS), value="15 min", label="Window")
+    live_plot = live_plot_component(DEFAULT_SEL, "15 min", _init_host)
+    gr.Timer(5).tick(live_plot_component, inputs=[live_sel, live_span, host_sel], outputs=live_plot)
+    live_sel.change(live_plot_component, [live_sel, live_span, host_sel], live_plot)
+    live_span.change(live_plot_component, [live_sel, live_span, host_sel], live_plot)
+    host_sel.change(stats_md, host_sel, panel)
+    host_sel.change(live_plot_component, [live_sel, live_span, host_sel], live_plot)
+
+    gr.Markdown("## History")
+    with gr.Row():
+        metric = gr.Dropdown(list(trends.METRICS), value="CPU temp (C)", label="Component / metric")
+        runs = gr.Dropdown(list(trends.RUNS), value="Last 25 runs", label="Show")
+    graph = gr.LinePlot(trends.series("CPU temp (C)", "Last 25 runs"),
+                        x="time", y="value", tooltip=["when", "value"],
+                        title="History", height=320)
+    metric.change(plot, [metric, runs], graph)
+    runs.change(plot, [metric, runs], graph)
+
+
+if __name__ == "__main__":
+    art.cli_banner()
+    try:
+        app.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True)
+    finally:
+        import subprocess  # free the model's VRAM on clean exit (Ctrl+C / window close)
+        subprocess.run(["ollama", "stop", brain.MODEL], check=False)
+```
+
+### `chat.py`
+
+```python
+# chat.py — Watch Tower from the command line. Same model + live system context as the web UI.
+# Read-only: it advises, it never runs anything. Blank line + Ctrl+C (or type 'exit') to quit.
+import art, brain
+
+PROMPT = "\033[38;2;173;216;230m❯\033[0m "   # light-blue prompt to match the banner
+
+
+def main():
+    art.cli_banner()
+    print("Ask about this machine. Type 'exit' or Ctrl+C to quit.\n")
+    history = []
+    while True:
+        try:
+            msg = input(PROMPT)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if msg.strip().lower() in ("exit", "quit"):
+            break
+        if not msg.strip():
+            continue
+        reply = brain.ask(msg, history)
+        print(f"\n{reply}\n")
+        history += [{"role": "user", "content": msg},
+                    {"role": "assistant", "content": reply}]
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        import subprocess  # free the model's VRAM on exit
+        subprocess.run(["ollama", "stop", brain.MODEL], check=False)
+```
+
+### `ship.py`
+
+```python
+# ship.py — run on the MONITORED machine: stream snapshots as JSON to the monitoring
+# side, either straight to Watchtower's /ingest or through Apache NiFi (ListenHTTP ->
+# InvokeHTTP). Stdlib only — the agent needs collectors/ + sysdiag.py + this file,
+# no pip installs. Two-tier cadence: FAST collectors every fast_seconds ({"partial":true}),
+# the full fleet every full_seconds.
+#
+# CUSTOMIZE THE SHIPPED JSON via ship.config.json (see ship.config.example.json):
+#   host        identity of THIS machine — how the monitoring side names/selects it
+#   label,tags  free-form display label + key/value metadata merged into every payload
+#   fast,full   which collectors go in each tier (full: null = the whole fleet)
+#   *_seconds   cadence;  narrate: attach the local NanoGPT report to full snapshots
+#   url         where to POST
+# The identity/destination keys are env-overridable (env wins) so ONE shared config can serve
+# many machines by varying just these two on the command line — host via WATCHTOWER_HOST, url
+# via WATCHTOWER_SHIP_URL. Other keys (label/tags/fast/full/cadence/narrate) come from the file
+# (or --narrate). Also honoured: WATCHTOWER_TOKEN (secret), WATCHTOWER_SHIP_CONFIG (config path).
+#
+# `python ship.py --narrate` (or "narrate": true) runs the local NanoGPT narrator on each
+# FULL snapshot and ships its report as snap["_report"] (needs torch + ckpt.pt here; without
+# them the flag degrades to a note and keeps shipping raw metrics).
+import json, os, socket, sys, time, urllib.request
+import sysdiag
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def load_config():
+    path = os.environ.get("WATCHTOWER_SHIP_CONFIG", os.path.join(HERE, "ship.config.json"))
+    cfg = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            cfg = {k: v for k, v in loaded.items() if not k.startswith("_")}
+        else:
+            print("ship.config.json ignored (not a JSON object)")   # a list/number/string
+    except FileNotFoundError:
+        pass                                    # config is optional; env + defaults suffice
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"ship.config.json ignored ({e})")
+    cfg.setdefault("host", socket.gethostname())
+    cfg.setdefault("label", "")
+    cfg.setdefault("tags", {})
+    cfg.setdefault("fast", ["cpu", "gpu", "mem", "sensors", "disk"])
+    cfg.setdefault("full", None)                # None = the whole collector fleet
+    cfg.setdefault("fast_seconds", 5)
+    cfg.setdefault("full_seconds", 60)
+    cfg.setdefault("narrate", False)
+    cfg.setdefault("url", "http://127.0.0.1:8081/watchtower")
+    # env overrides (env always wins over the file)
+    cfg["url"] = os.environ.get("WATCHTOWER_SHIP_URL", cfg["url"])
+    cfg["host"] = os.environ.get("WATCHTOWER_HOST", cfg["host"])
+    if "--narrate" in sys.argv:
+        cfg["narrate"] = True
+    return cfg
+
+
+def narrate(snap):
+    try:
+        import schema, infer
+        bundle = narrate.bundle = getattr(narrate, "bundle", None) or infer.load()
+        return infer.generate_report(bundle, schema.serialize_metrics(snap))
+    except Exception as e:
+        return f"(narrator unavailable on agent: {e})"
+
+
+def post(url, token, payload):
+    req = urllib.request.Request(
+        url, json.dumps(payload).encode(),
+        {"Content-Type": "application/json", "X-Watchtower-Token": token})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        r.read()
+
+
+def main():
+    cfg = load_config()
+    token = os.environ.get("WATCHTOWER_TOKEN", "")
+    print(f"shipping {cfg['host']} -> {cfg['url']} "
+          f"(fast {cfg['fast_seconds']}s / full {cfg['full_seconds']}s"
+          + (", narrated" if cfg["narrate"] else "") + ")")
+    last_full = 0.0
+    while True:
+        t0 = time.time()
+        partial = t0 - last_full < cfg["full_seconds"]
+        snap = sysdiag.snapshot(only=cfg["fast"]) if partial else sysdiag.snapshot(only=cfg["full"])
+        if not partial:
+            last_full = t0
+            if cfg["narrate"]:
+                snap["_report"] = narrate(snap)
+        try:
+            post(cfg["url"], token, {"host": cfg["host"], "label": cfg["label"],
+                                     "tags": cfg["tags"], "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                     "partial": partial, "snap": snap})
+        except Exception as e:
+            print("ship failed (will retry next tick):", e)   # NiFi/GUI down -> drop this
+        #                                                       tick; NiFi buffers once it's back
+        time.sleep(max(0.5, cfg["fast_seconds"] - (time.time() - t0)))
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### `discover.py`
+
+```python
+# discover.py — scan the buses (USB/PCI via PnP, plus COM ports), map what's found to
+# the collector that should cover it, and report coverage. `--spawn` writes a stub
+# collector for any recognized device that has none (never overwrites). New stubs are
+# picked up automatically by sysdiag.py's snapshot() glob — that's the whole loop:
+#   plug it in -> discover sees it -> spawn stub -> fill stub -> it's in every snapshot.
+import json, re, subprocess, sys, pathlib
+
+HERE = pathlib.Path(__file__).parent
+COLLECTORS = HERE / "collectors"
+sys.path.insert(0, str(COLLECTORS))
+from _sdr_common import KNOWN as SDR_SIGS   # single source of truth for SDR signatures
+
+# (VID, PID-or-None) -> (collector, label). PID None = any product from that vendor.
+DEVICE_MAP = {sig: ("sdr", label) for sig, label in SDR_SIGS.items()}
+DEVICE_MAP.update({
+    ("1E71", None): ("sensors", "NZXT AIO (liquid temp: LHM or liquidctl)"),
+    ("1B1C", None): ("lights",  "Corsair RGB (via OpenRGB SDK)"),
+})
+
+STUB = '''# collectors/{name}.py — AUTO-SPAWNED by discover.py for: {label}
+# This device was seen on the bus with no collector covering it. Contract:
+# print ONE json object namespaced under "{name}"; absent hardware -> {{"present": false}};
+# hardware problems are values (rules.py judges them), exceptions only for real failures.
+import json
+print(json.dumps({{"{name}": {{"present": True, "stub": True,
+                             "matched": "{label}",
+                             "note": "auto-spawned stub - fill with real metrics"}}}}))
+'''
+
+
+def scan_pnp():
+    ps = (r"Get-PnpDevice -PresentOnly -EA SilentlyContinue | "
+          r"Select-Object Class,FriendlyName,InstanceId,Status | ConvertTo-Json -Compress")
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, timeout=30).stdout.strip()
+    devs = json.loads(out) if out else []
+    return devs if isinstance(devs, list) else [devs]
+
+
+def com_ports():
+    ps = (r"(Get-ItemProperty 'HKLM:\HARDWARE\DEVICEMAP\SERIALCOMM' -EA SilentlyContinue)."
+          r"PSObject.Properties | Where-Object {$_.Name -notlike 'PS*'} | "
+          r"ForEach-Object {$_.Value}")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=15).stdout
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+
+def matches(devs):
+    seen = {}
+    for d in devs:
+        m = re.search(r"VID_([0-9A-F]{4})&PID_([0-9A-F]{4})", d.get("InstanceId") or "", re.I)
+        if not m:
+            continue
+        vid, pid = m.group(1).upper(), m.group(2).upper()
+        hit = DEVICE_MAP.get((vid, pid)) or DEVICE_MAP.get((vid, None))
+        if hit:
+            seen.setdefault(hit, []).append(d.get("FriendlyName") or f"{vid}:{pid}")
+    return seen
+
+
+def main(spawn=False):
+    devs = scan_pnp()
+    hits = matches(devs)
+    bad = [d for d in devs if (d.get("Status") or "OK") not in ("OK", "Unknown")]
+
+    print(f"scanned {len(devs)} present PnP devices")
+    for (collector, label), names in sorted(hits.items()):
+        path = COLLECTORS / f"{collector}.py"
+        state = "covered" if path.exists() else "NO COLLECTOR"
+        print(f"  [{state:12}] {label} -> collectors/{collector}.py ({len(names)}x: {names[0]})")
+        if spawn and not path.exists():
+            path.write_text(STUB.format(name=collector, label=label), encoding="utf-8")
+            print(f"               spawned {path.name} — fill it in, next snapshot runs it")
+    for port in com_ports():
+        print(f"  [candidate   ] serial port {port} — instruments here need a bespoke collector")
+    for d in bad:
+        print(f"  [problem     ] {d.get('FriendlyName')} status={d.get('Status')}")
+    if not hits:
+        print("  no mapped devices found (edit DEVICE_MAP / _sdr_common.KNOWN to teach it more)")
+
+
+if __name__ == "__main__":
+    main(spawn="--spawn" in sys.argv)
+```
+
+### `brain.py` (system prompt adapted for Linux/bash/sudo)
+
+Identical to the Windows `brain.py` except the system prompt speaks bash/sudo instead of PowerShell/Administrator.
+
+```python
+### brain.py — the chatbot brain. Qwen2.5-32B via Ollama, grounded in the live system state from context.py. READ-ONLY: the model is told it cannot act, and nothing it returns is ever executed — its output is text shown to a human. ###
+
+import json, urllib.request, urllib.error
+import context
+
+OLLAMA = "http://127.0.0.1:11434/api/chat"
+MODEL = "qwen2.5:32b"            # Q4_K_M by default; fits the <GPU>'s 32GB VRAM
+
+SYSTEM = """You are a hands-on hardware-diagnostics and troubleshooting expert for THIS
+specific Linux machine. You answer questions about its health and tell the user EXACTLY what
+to do — as concrete, copy-pasteable steps.
+
+How to answer — ALWAYS:
+- Give numbered, step-by-step instructions. Assume the user copies and runs each step.
+- For EVERY command state all four: (1) the shell — bash; (2) the exact command in a code
+  block; (3) the folder to run it from — give the literal `cd` command when it matters; (4)
+  whether it needs an root/sudo. If it does, say so first and tell them to
+  prefix with `sudo` before that step.
+- End with: what a successful result looks like, and the one thing to check if it fails.
+- Prefer built-in Linux/coreutils commands and the user's own `sysdiag` tool. Do NOT invent
+  commands, flags, or file paths. If you're unsure a command exists or is safe, say so instead of
+  guessing.
+- BEFORE any destructive or risky step (deleting files, editing the registry, killing processes,
+  anything elevated), put a one-line warning so the user reads it before running.
+
+Hard rules:
+- You only ADVISE. You never run anything — the user runs the steps and decides.
+- The FINDINGS list is deterministic ground truth from a rules engine. Trust it over your own
+  inference; if you disagree with the findings, the findings win.
+- Use the STATIC FACTS to judge what's normal for THIS machine and where things live.
+- Ground every recommendation in the live snapshot + findings below; cite the actual numbers.
+  If the data doesn't show something, say so. Never invent readings, events, or commands.
+
+{ctx}"""
+
+def _text(content):
+    """Ollama's /api/chat needs content as a plain string; Gradio sometimes hands a
+    list of parts (e.g. [{'type':'text','text':...}]) which Ollama 400s on."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+    return "" if content is None else str(content)
+
+
+def ask(message, history, host=None):
+    """Gradio ChatInterface fn (type='messages'): history is [{role,content}, ...].
+    host (from the GUI's host selector as an additional_input) picks which machine to answer
+    about; None (e.g. CLI chat.py) falls back to the sampler's focused/only host."""
+    user_text = _text(message)
+    msgs = [{"role": "system", "content": SYSTEM.format(ctx=context.build(user_text, host))}]
+    msgs += [{"role": m["role"], "content": _text(m.get("content"))} for m in (history or [])]
+    msgs.append({"role": "user", "content": user_text})
+    body = json.dumps({"model": MODEL, "messages": msgs, "stream": False,
+                       "keep_alive": "30m",  # stay resident between messages; reload only after long idle
+                       "options": {"temperature": 0.3, "num_ctx": 32768}}).encode()
+    req = urllib.request.Request(OLLAMA, data=body,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:  # 300s survives a 19GB cold load
+            return json.loads(r.read())["message"]["content"]
+    except urllib.error.HTTPError as e:  # show Ollama's own error, not a generic "can't reach"
+        return f"(Ollama returned HTTP {e.code}: {e.read().decode(errors='replace')[:300]})"
+    except Exception as e:
+        return f"(couldn't reach Ollama at {OLLAMA}: {e}. Is `ollama` running? Try `ollama ps`.)"
+
+
+def demo():  # the one runnable check: a grounded answer comes back (needs Ollama up)
+    # the bug this guards: list-shaped content must flatten to a string, not 400 Ollama
+    assert _text([{"type": "text", "text": "a"}, {"text": "b"}]) == "ab"
+    assert _text("hi") == "hi" and _text(None) == ""
+    reply = ask("Is anything wrong right now? One sentence.", [])
+    assert isinstance(reply, str) and reply.strip(), "no reply from the brain"
+    print("brain ok:", reply[:160])
+
+
+if __name__ == "__main__":
+    demo()
+```
+
+### `system_facts.md` (edit for YOUR machine)
+
+```text
+# This machine
+
+- CPU: <your CPU> (cores/threads, TjMax). Note what temps are normal under load.
+- GPU: <your GPU>, <VRAM>. Note the edge temp limit and expected load temps.
+- RAM: <size/speed>.
+- Storage: <OS drive>; other drives.
+- Role: <what this box does> — runs Ollama, maybe Docker, a homelab.
+- What I care about: failing components, thermal throttling, hardware errors, disks filling, a fan stalling.
+```
+
+### `ship.config.example.json`
+
+```json
+{
+  "_comment": "Copy to ship.config.json on each MONITORED machine and edit. Env vars override any key here. This is where you set the reporter's identity and shape the shipped JSON.",
+
+  "host": "lab-pc-01",
+  "label": "Lab PC — rack 2, GPU node",
+  "tags": { "location": "basement", "role": "gpu-node", "owner": "dylan" },
+
+  "fast": ["cpu", "gpu", "mem", "sensors", "disk"],
+  "full": null,
+
+  "fast_seconds": 5,
+  "full_seconds": 60,
+
+  "narrate": false,
+
+  "url": "http://nifi-or-gui-host:8081/watchtower"
+}
+```
+
+### `ssh.config.example.json`
+
+```json
+{
+  "_comment": "Collector: SSH into remote Linux VMs and scrape read-only checks. Copy to ssh.config.json (gitignored). KEY-BASED AUTH ONLY — set up an SSH key to each VM first (ssh-copy-id); passwords are disabled. A new VM must be in known_hosts, or set accept_new:true for trust-on-first-use. Reading a file = a check whose cmd is `cat`/`grep /path`.",
+
+  "connect_timeout": 6,
+
+  "targets": [
+    {
+      "name": "db-vm",
+      "ssh": "monitor@10.0.0.5",
+      "port": 22,
+      "key": "~/.ssh/id_ed25519",
+      "accept_new": false,
+      "jump": "monitor@bastion.example",
+      "checks": {
+        "disk_root_pct":  { "cmd": "df --output=pcent / | tail -1 | tr -dc 0-9", "warn": 85, "crit": 95, "unit": "%" },
+        "load1":          { "cmd": "cut -d' ' -f1 /proc/loadavg", "warn": 8, "crit": 16 },
+        "mem_used_pct":   { "cmd": "free | awk '/Mem:/ {printf \"%d\", $3/$2*100}'", "warn": 90, "crit": 97, "unit": "%" },
+        "postgres":       "systemctl is-active postgresql",
+        "cert_days_left": { "cmd": "echo $(( ( $(date -d \"$(openssl x509 -enddate -noout -in /etc/ssl/certs/site.pem | cut -d= -f2)\" +%s) - $(date +%s) ) / 86400 ))", "warn": 30, "crit": 7, "unit": "d" },
+        "app_debug_on":   "grep -c '^DEBUG=true' /etc/myapp/config.env || true",
+        "last_backup_age_h": { "cmd": "echo $(( ( $(date +%s) - $(stat -c %Y /var/backups/db.sql.gz) ) / 3600 ))", "warn": 26, "crit": 50, "unit": "h" }
+      }
+    },
+    {
+      "name": "web-vm",
+      "ssh": "monitor@10.0.0.6",
+      "checks": {
+        "nginx":         "systemctl is-active nginx",
+        "http_health":   "curl -s --max-time 4 -o /dev/null -w '%{http_code}' http://localhost/health",
+        "open_fds_pct":  { "cmd": "awk '{print int($1/$3*100)}' /proc/sys/fs/file-nr 2>/dev/null || echo 0", "warn": 80, "crit": 95, "unit": "%" }
+      }
+    }
+  ]
+}
+```
+
+## 6. Build it — step by step (with expected output)
+
+### 6.1 Virtual env + dependencies
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install gradio pandas psutil
+```
+Confirm torch sees your GPU:
+```bash
+python -c "import torch,gradio,pandas; print('torch',torch.__version__,'cuda',torch.cuda.is_available())"
+```
+> `cuda True` means the GPU is visible. `False` still runs (the GPT trains on CPU in minutes; the
+> 32B Ollama model wants a GPU to be usable).
+
+### 6.2 Sanity-check the pure-logic modules
+```bash
+python schema.py
+python rules.py
+python live.py
+python collectors/docker.py --test
+```
+Expected: `schema ok`, `rules ok`, `live ok — ...`, `docker parsers ok`.
+
+### 6.3 Generate the corpus, train, test the GPT
+```bash
+python data.py 8000        # -> wrote corpus.txt: 8000 docs, ...
+python train.py            # -> trains ~2-5 min on a CUDA GPU; writes ckpt.pt + vocab.json
+python infer.py --demo     # -> MODEL OUTPUT should read like the GROUND TRUTH
+```
+
+### 6.4 Run the live collectors
+```bash
+python collectors/gpu.py
+python collectors/sensors.py
+python sysdiag.py
+```
+> `storage` needs root for SMART; `whea`/`power` read the journal (systemd-journal group or sudo).
+
+### 6.5 Full live snapshot as JSON
+```bash
+python sysdiag.py diag --json
+```
+A big pretty-printed JSON object with every collector's namespace — exactly what `context.py`
+feeds the chat model, and what `ship.py` streams in remote mode.
+
+### 6.6 Discover devices (optional)
+```bash
+python sysdiag.py discover           # list known devices -> collector coverage
+python sysdiag.py discover --spawn   # stub a collector for a recognized, uncovered device
+```
+
+---
+
+## 7. Connect Ollama (the 32B chat model)
+
+1. Install Ollama — it serves on `127.0.0.1:11434`.
+2. Pull the model (~19 GB): `ollama pull qwen2.5:32b`
+3. Verify: `ollama run qwen2.5:32b "say OK"` → `OK`.
+4. Check it's resident: `ollama ps`.
+
+> **Model / VRAM notes** (set in `brain.py`): `MODEL` = any pulled model (`ollama list`);
+> `num_ctx=32768` costs ~256 KB/token of KV cache for a 32B (~8 GB at 32k) — with the ~19 GB
+> weights that's ~28 GB, fits a 32 GB GPU; drop to `16384`/`8192` on a smaller GPU.
+> `keep_alive="30m"` keeps it warm; `app.py`/`chat.py` run `ollama stop` on clean exit.
+
+Smoke-test the brain (Ollama up): `python brain.py` → `brain ok: <a sentence about your machine>`.
+
+### US-built open-weight alternatives
+`brain.py` defaults to `qwen2.5:32b` (Alibaba). To run a US-built model, `ollama pull` one and set
+`MODEL` to that tag — same code path. Strong picks: **`gpt-oss:20b`** (OpenAI, ~14 GB) or
+**`gemma3:27b`** (Google, ~17 GB) or **`phi4`** (Microsoft, ~9 GB) on a ~32 GB GPU;
+**`llama3.1:8b`** / **`granite3.3:8b`** (IBM) for ~8 GB; **`llama3.2:3b`** / **`gemma3:4b`** /
+**`phi4-mini`** for CPU-only. Sizing: weights + KV(`num_ctx`) ≤ VRAM, else lower `num_ctx`.
+
+---
+
+## 8. Run it
+
+### CLI chat
+```bash
+python chat.py
+```
+Banner, then a prompt. Ask "Is my GPU temp normal?" — grounded answer. `exit` frees VRAM.
+
+### Web dashboard
+```bash
+python app.py
+```
+Opens `http://127.0.0.1:7860`: host selector, live stats/findings panel (5 s), chat, live graphs,
+History graph. **Ctrl+C** to stop (frees VRAM). **Restart `app.py` after editing any `.py`** —
+Gradio caches modules.
+
+---
+
+## 9. Remote monitoring, multi-host & NiFi
+
+Collectors run on the **monitored** machine; the dashboard/rules/chat run on the **monitoring**
+machine; the tiny NanoGPT narrator is portable. The agent side is stdlib-only — copy
+`collectors/`, `sysdiag.py`, `ship.py` (no pip installs).
 
 ```bash
-python rag.py --build
+# on the MONITORED machine (agent) — add --narrate to ship NanoGPT reports too
+set WATCHTOWER_SHIP_URL=http://<nifi-or-gui-host>:8081/watchtower
+set WATCHTOWER_TOKEN=<shared-secret>
+python ship.py
+
+# on the MONITORING machine (dashboard)
+set WATCHTOWER_REMOTE=1
+set WATCHTOWER_TOKEN=<shared-secret>
+python app.py
 ```
-Expected (counts depend on your docs; the big scraped corpora dominate):
-```
-indexing 20 new/changed doc(s) of 20 (batch=64)...
-  [indexed] HOMELAB-COMPLETE-SETUP.md: 37 chunks
-  [indexed] Docker-Troubleshooting.md: 290 chunks
-  [indexed] arch-wiki-merged.md: 21044 chunks
-  [indexed] powershell-docs-merged.md: 28850 chunks
-  ...
-index built: 54213 chunks from 20 doc(s)
-```
-- It commits **per document**, so a long first build is safe to Ctrl+C and resume — re-running
-  `--build` continues where it left off.
-- A multi-MB corpus (e.g. the merged PowerShell/Arch/Linux wikis) is **tens of thousands of
-  chunks**. On a GPU that Ollama can use for the embedder, that's minutes; on CPU, longer (let it
-  run). After the first build it's instant unless a doc changes.
-- Re-run `python rag.py --build` after editing or adding any doc — only the changed/new docs
-  re-embed (see §13.6). Use `--build --force` only after changing `CHUNK_CHARS`/`OVERLAP`/the
-  embedder, which invalidates every stored vector.
 
-### 13.6 How it scales to a large corpus (batch + incremental)
+Per-machine identity/format lives in `ship.config.json` (copy `ship.config.example.json`):
+`host` names the reporter, `label`/`tags` show on the panel, `fast`/`full` pick the collector
+tiers. Each distinct `host` gets its own ring; the dashboard's **Host** selector switches the
+panel/graphs/chat between machines. `WATCHTOWER_REMOTE=1` runs a token-gated HTTP receiver
+(`POST /ingest`, default `0.0.0.0:7861`) instead of the local sampler.
 
-Two design choices make a 60 MB+ corpus practical:
+**Apache NiFi** (optional middle hop) buys durable queueing, provenance, and fan-out — minimal
+flow is two processors: **ListenHTTP** (Port `8081`, Base Path `watchtower`, forward header
+`X-Watchtower-Token`) → **InvokeHTTP** (POST `http://<gui-host>:7861/ingest`, send header
+`X-Watchtower-Token`). Full detail + config in `docs/INSTRUCTIONS.md` §7.
 
-1. **Batch embedding.** `_embed_all` posts up to `EMBED_BATCH` (64) chunks per `/api/embed` call
-   instead of one HTTP round-trip per chunk. On a large corpus that's the difference between
-   minutes and hours. If your Ollama predates `/api/embed`, `_embed_batch` catches the 404 and
-   transparently falls back to the one-at-a-time `/api/embeddings` endpoint.
+### SSH: scrape remote Linux VMs
+`collectors/ssh.py` SSHes into Linux VMs and runs read-only checks (a check is a shell command;
+reading a file = `cat`/`grep`). Configure `ssh.config.json` (copy `ssh.config.example.json`):
+key-based auth only, host-key checking on, per-check `warn`/`crit` thresholds (direction inferred
+from `crit`≷`warn`), unreachable = WARN, ~20 s wall-clock budget. See `docs/INSTRUCTIONS.md` §8.
 
-2. **Incremental indexing.** Each source's SHA-256 is stored in a `sources` table. On every build,
-   `rag.py` compares hashes and re-embeds **only** new or changed docs; docs you removed from
-   `SOURCES` are deleted from the index. So editing one small note re-embeds seconds of work, not
-   the whole corpus — and the per-document commit makes the build resumable.
+---
 
-The store is **sqlite-vec**, whose KNN runs in the DB engine, so ~50k+ vectors stay fast. Retrieval
-always returns just `TOP_K` chunks, so corpus size never bloats the chat context — a bigger library
-only improves recall. (Both behaviors are covered by the `python rag.py` self-tests and a small
-incremental-logic check.)
+## 10. Schedule history logging (the History graph's data)
 
-### 13.7 Verify end to end
+Cron every ~15 min (absolute paths, the venv python):
 
 ```bash
-python context.py
-```
-A homelab/manual-style question pulls a `REFERENCE DOCS (...)` section into the printed block; a
-pure-hardware question (e.g. "is my GPU hot?") won't.
-
-Calibrate the relevance floor — `--scores` prints every chunk's cosine so you can pick `MIN_SCORE`:
-```bash
-python rag.py --scores "what ports do I have on my motherboard?"
-```
-```
-0.71  [MAG_Z790_TOMAHAWK_MAX_WIFI_User_Guide.md] ## Rear I/O ...
-0.68  [MAG_Z790_TOMAHAWK_MAX_WIFI_User_Guide.md] ### USB connectors ...
-0.39  [Docker-Troubleshooting.md] ## Networking ...
-```
-Then use the chat as normal — it cites the retrieved text instead of guessing:
-```bash
-python chat.py        # or: python app.py
+crontab -e
+# add:
+*/15 * * * * cd ~/sysdiag && ~/sysdiag/.venv/bin/python history.py >> ~/sysdiag/history.log 2>&1
 ```
 
-### 13.8 Tuning & maintenance
+---
 
-| Knob (in `rag.py`) | Default | Change it when |
+## 11. Troubleshooting
+
+| Symptom | Cause | Fix |
 |---|---|---|
-| `SOURCES` | every `*.md` in the folder + homelab doc | it's a glob — just drop a `.md` in the folder |
-| `MIN_SCORE` | `0.45` | **the main dial.** Higher = stricter (less noise); lower = looser (more recall) |
-| `TOP_K` | `4` | answers need more context; watch you don't blow `num_ctx` in `brain.py` |
-| `CHUNK_CHARS` / `OVERLAP` | `1200` / `200` | smaller = finer retrieval; bigger = more context per hit |
-| `EMBED_MODEL` | `nomic-embed-text` | switching embedder (adjust the prefixes; `--build --force`) |
-| `EMBED_BATCH` | `64` | lower if Ollama OOMs on a batch; higher to squeeze a fast GPU |
+| `sensors: {}` / no temps | lm-sensors not detected | `sudo sensors-detect` then re-run |
+| `storage` degraded | SMART needs root | run as root or add a sudoers rule for `smartctl` |
+| `whea`/`power` empty | no journal access | add your user to `systemd-journal` or use sudo |
+| `(couldn't reach Ollama …)` | service down / model not pulled | `ollama ps`, `ollama pull qwen2.5:32b` |
+| Live graph blank | opened before the ring filled | wait ~10 s; the plot rebuilds each tick |
+| Edited a file, app unchanged | Gradio cached the module | restart `app.py` |
 
-Git-ignore the cache (already in this project's `.gitignore`):
-```
-rag_index.db
-```
+---
 
-### 13.9 Troubleshooting
+## 12. Add a local RAG pipeline (semantic doc retrieval)
 
-| Symptom | Cause / fix |
-|---|---|
-| `HTTP Error 404` on embed | embed model not pulled — `ollama pull nomic-embed-text`; check `ollama list` |
-| retrieval always empty | you pointed `EMBED_MODEL` at a **chat** model (empty vectors). Use a real embedder |
-| nothing retrieved for a relevant question | `MIN_SCORE` too high, or the doc isn't in the folder. Use `python rag.py --scores "..."` |
-| off-topic questions still pull chunks | `MIN_SCORE` too low — raise it |
-| first build is slow | expected on a big corpus; it batches + commits per doc, so it's resumable |
-| edited a doc, answer unchanged | rebuild: `python rag.py --build` (only that doc re-embeds) |
-| `OperationalError` on `enable_load_extension` | your Python can't load SQLite extensions — rebuild `sqlite3` with them enabled |
+Optional. Everything above gives the chat a *live* picture (snapshot + findings) plus a static
+`system_facts.md`. **RAG** adds a *reference library*: point it at any Markdown docs — homelab
+notes, hardware manuals, runbooks, scraped wikis — and the model gets only the few paragraphs
+relevant to each question, by semantic similarity. Local-only, read-only, degrades to silence if
+Ollama is down. It adds **one file** (`rag.py`) and edits **one** (`context.py`); `brain.py` does
+not change. Built to scale: it embeds in **batches** and indexes **incrementally**, so a large
+corpus builds in minutes and editing one doc re-embeds only that doc.
+
+1. **Pull an embedding model:** `ollama pull nomic-embed-text` and `pip install sqlite-vec`.
+2. **Add `rag.py`** — the real file is embedded below.
+3. **Wire it into `context.py`** — the shipped `context.py` already calls
+   `rag.context_block(message)` (see its source above), so no edit is needed if you use these
+   files as-is.
+4. **Build the index:** `python rag.py --build` (re-run anytime; `--build --force` re-embeds all).
+5. **Verify:** `python rag.py "how is my reverse proxy set up?"` returns ranked chunks.
+
+`rag.py`'s full source is in §5 above (it's a core file — `context.py` imports it). Tuning knobs
+live at its top (`TOP_K`, `MIN_SCORE`, `CHUNK_*`, the embed model + task prefixes) — the RAG
+equivalent of `rules.THRESH`. Lower `TOP_K` / raise `MIN_SCORE` if the context gets too big and
+the model starts replying in one line.
+
