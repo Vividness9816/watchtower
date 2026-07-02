@@ -24,13 +24,20 @@ METRICS = {
     "Liquid temp (C)":  ("sensors", "liquid_temp"),
     "Pump (RPM)":       ("sensors", "pump_rpm"),
     "RAM used (%)":     ("mem", "pct"),
+    "Disk C used (%)":  ("disk", "C"),
     "Ping (ms)":        ("net", "ping_ms"),
     "DNS (ms)":         ("net", "dns_ms"),
+    "WHEA errors":      ("whea", "recent_errors"),
 }
+# labels backed by FAST-tier collectors get a fresh point every tick; the rest only when
+# the full fleet runs — recording them per-tick would fake 12 duplicate samples per real one
+FAST_LABELS = {lbl for lbl, path in METRICS.items() if path[0] in FAST}
 
 _lock = threading.Lock()
 _snap: dict = {}
-_stamp = 0.0
+_stamp = 0.0                                        # last record of ANY tier
+_full_stamp = 0.0                                   # last FULL-fleet record
+_errs = {"fast": [], "full": []}                    # per-tier, so a recovered tick clears its own
 _buf = collections.deque(maxlen=KEEP)               # (epoch, {label: value})
 _thread = None
 
@@ -45,22 +52,39 @@ def _dig(snap, path):
 
 
 def _record(fresh, merge):
-    global _snap, _stamp
+    global _snap, _stamp, _full_stamp
+    errs = fresh.pop("_errors", [])
     with _lock:
-        _snap = {**_snap, **fresh} if merge else fresh
+        if merge:                                   # fast tier: authoritative for its own errors
+            _errs["fast"] = errs
+            _snap = {**_snap, **fresh}
+            labels = FAST_LABELS
+        else:                                       # full fleet: authoritative for everything
+            _errs["fast"], _errs["full"] = [], errs
+            _snap = fresh
+            _full_stamp = time.time()
+            labels = METRICS.keys()
+        combined = _errs["fast"] + _errs["full"]
+        _snap.pop("_errors", None)
+        if combined:
+            _snap["_errors"] = combined
         _stamp = time.time()
-        _buf.append((_stamp, {lbl: _dig(_snap, p) for lbl, p in METRICS.items()}))
+        _buf.append((_stamp, {lbl: _dig(_snap, METRICS[lbl]) for lbl in labels}))
 
 
 def _loop():
     last_full = time.time()                          # start() already took the first full
     while True:
         t0 = time.time()
-        if t0 - last_full >= FULL_S:
-            _record(sysdiag.snapshot(), merge=False)
-            last_full = t0
-        else:
-            _record(sysdiag.snapshot(only=FAST), merge=True)
+        try:
+            if t0 - last_full >= FULL_S:
+                _record(sysdiag.snapshot(), merge=False)
+                last_full = t0
+            else:
+                _record(sysdiag.snapshot(only=FAST), merge=True)
+        except Exception:
+            pass    # a transient failure (or interpreter shutdown race) must not kill the
+        #             sampler for the rest of the app's life; the next tick retries
         time.sleep(max(0.5, FAST_S - (time.time() - t0)))
 
 
@@ -75,9 +99,12 @@ def start():
 
 
 def get_latest():
-    """-> (snapshot dict, age_seconds). Empty dict + inf if the sampler never ran."""
+    """-> (snapshot, fast_age_s, full_age_s). Empty dict + inf/inf if the sampler never ran."""
+    now = time.time()
     with _lock:
-        return dict(_snap), (time.time() - _stamp if _stamp else float("inf"))
+        return (dict(_snap),
+                now - _stamp if _stamp else float("inf"),
+                now - _full_stamp if _full_stamp else float("inf"))
 
 
 SPANS = {"5 min": 5, "15 min": 15, "60 min": 60}
@@ -117,12 +144,17 @@ def deltas(minutes=10):
 def demo():  # the one runnable check: sampler produces rows and frame() shapes them
     start()
     time.sleep(FAST_S + 2)
-    snap, age = get_latest()
+    snap, age, full_age = get_latest()
     assert snap and age < FAST_S + 3, f"sampler not live (age {age})"
+    assert full_age < FULL_S + 30, f"no full pass (age {full_age})"
     df = frame(["CPU load (%)", "GPU temp (C)"], "5 min")
     assert list(df.columns) == ["time", "value", "series"] and len(df) >= 1, "frame broken"
     assert deltas(), "deltas empty"
-    print(f"live ok — {len(df)} plot rows, snapshot age {age:.1f}s")
+    # per-tier recording: a fast tick must NOT re-record full-only labels like Ping (ms)
+    with _lock:
+        fast_rows = [vals for ts, vals in _buf if "Ping (ms)" not in vals]
+    assert fast_rows, "fast ticks are re-recording full-tier labels"
+    print(f"live ok — {len(df)} plot rows, fast age {age:.1f}s, full age {full_age:.1f}s")
 
 
 if __name__ == "__main__":

@@ -2,9 +2,11 @@
 import gradio as gr
 import schema, brain, context, art, trends, live
 
-live.start()   # background sampler: fast metrics every 5s, full fleet every 60s.
-#                The stats panel, live graphs AND the chat brain all read its cache —
-#                nothing in the UI spawns the collector fleet per tick anymore.
+if gr.NO_RELOAD:   # guard: `gradio app.py` reload mode re-imports modules — without this,
+    live.start()   # every source edit would leak one more immortal sampler thread.
+#                Background sampler: fast metrics every 5s, full fleet every 60s. The stats
+#                panel, live graphs AND the chat brain all read its cache — nothing in the
+#                UI spawns the collector fleet per tick anymore.
 
 
 def stats_md() -> str:
@@ -54,7 +56,7 @@ with gr.Blocks(title="Watch Tower") as app:
         live_span = gr.Dropdown(list(live.SPANS), value="15 min", label="Window")
     live_plot = gr.LinePlot(live.frame(["CPU temp (C)", "GPU temp (C)", "Liquid temp (C)"]),
                             x="time", y="value", color="series",
-                            title="Live (5s samples)", height=320)
+                            title="Live (5s fast tier; net/whea every 60s)", height=320)
     gr.Timer(5).tick(live.frame, inputs=[live_sel, live_span], outputs=live_plot)
     live_sel.change(live.frame, [live_sel, live_span], live_plot)
     live_span.change(live.frame, [live_sel, live_span], live_plot)

@@ -170,10 +170,11 @@ software-visible shadow of the board's debug LEDs (which are POST-time hardware 
 **Live sampling.** `live.py` runs a background sampler inside the app: cheap collectors
 (cpu/gpu/mem/sensors/disk) every 5s, the full fleet every 60s, kept in a ~1h in-memory ring.
 The dashboard's stats panel, the **Live graphs** section (multi-select metrics, 5/15/60-min
-window, 5s refresh) and the chat brain all read this cache — a chat message costs zero
-collector runs and the LLM context carries the fresh snapshot (age-stamped) plus a
-`RECENT TRENDS` digest of the last 10 minutes. Long-term history stays with
-`history.py`/Task Scheduler and the History graphs.
+window, 5s refresh; full-fleet metrics like net/whea plot at their real 60s cadence) and the
+chat brain all read this cache — a chat message normally costs zero collector runs (it falls
+back to a one-shot snapshot only if the cache is stale) and the LLM context carries the
+snapshot with per-tier age stamps plus a `RECENT TRENDS` digest of the last 10 minutes.
+Long-term history stays with `history.py`/Task Scheduler and the History graphs.
 
 **Bus discovery.** `python sysdiag.py discover` scans USB/PCI (PnP) + COM ports and maps known
 devices (SDRs, AIOs, RGB) to the collector that should cover them; add `--spawn` to write a stub

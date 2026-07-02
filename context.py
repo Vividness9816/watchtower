@@ -18,9 +18,10 @@ def _snapshot() -> dict:
     # (CLI chat.py, sysdiag report) so behavior there is unchanged
     try:
         import live
-        snap, age = live.get_latest()
+        snap, age, full_age = live.get_latest()
         if snap and age < 3 * live.FAST_S:
-            return {**snap, "_snapshot_age_s": round(age, 1)}
+            return {**snap, "_snapshot_age_s": round(age, 1),
+                    "_full_fleet_age_s": round(min(full_age, 9999), 1)}
     except Exception:
         pass
     try:
@@ -40,11 +41,15 @@ def snapshot_and_findings():
 
 def build(message: str = "") -> str:
     snap, findings = snapshot_and_findings()
+    age, full_age = snap.get("_snapshot_age_s"), snap.get("_full_fleet_age_s")
+    label = ("LIVE SNAPSHOT (JSON, just collected):" if age is None else
+             f"LIVE SNAPSHOT (JSON; fast metrics ~{age}s old, "
+             f"full fleet — net/docker/whea/power/storage — ~{full_age}s old):")
     parts = [
         "STATIC FACTS ABOUT THIS MACHINE:",
         _read(FACTS) or "(no system_facts.md)",
         "",
-        "LIVE SNAPSHOT (JSON, just collected):",
+        label,
         json.dumps(snap, indent=2),
         "",
         "FINDINGS (deterministic ground truth from rules.py — trust these over guesses):",

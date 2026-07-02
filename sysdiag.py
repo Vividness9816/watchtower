@@ -4,15 +4,23 @@ HERE = pathlib.Path(__file__).parent
 
 
 def snapshot(only=None) -> dict:
-    """only: None = all collectors, "name" = one, ["a","b"] = a subset (live.py fast tier)."""
+    """only: None = all collectors, "name" = one, ["a","b"] = a subset (live.py fast tier).
+    An empty list means zero collectors (returns {}), not the full fleet; unknown names in a
+    list are reported once in _errors instead of spawning a doomed subprocess."""
     snap = {}
-    if only and not isinstance(only, str):
-        files = [str(HERE / "collectors" / f"{n}.py") for n in sorted(only)]
+    if only is not None and not isinstance(only, str):
+        want = [(n, HERE / "collectors" / f"{n}.py") for n in sorted(only)]
+        files = [str(p) for n, p in want if p.exists()]
+        for n, p in want:
+            if not p.exists():
+                snap.setdefault("_errors", []).append(f"{n}: unknown collector")
     else:
         pattern = str(HERE / "collectors" / (f"{only}.py" if only else "*.py"))
         files = sorted(glob.glob(pattern))
     files = [f for f in files
              if not pathlib.Path(f).name.startswith("_")]   # _*.py = shared libs, not collectors
+    if not files:
+        return snap
 
     def run_one(f):
         # -P keeps collectors/ off the child's sys.path so usb.py/power.py can't shadow pip pkgs
