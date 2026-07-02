@@ -3,8 +3,11 @@
 # Detection is two-layer: USB VID:PID (works with zero SDR software) then SoapySDR
 # enumeration (works for anything with a Soapy driver: rtl-sdr, HackRF, Lime, USRP...).
 import json, os, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # survives python -P
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)                     # only to reach _sdr_common under python -P...
 from _sdr_common import usb_sdrs, soapy_devices, absent
+sys.path.remove(_here)      # ...then off again, so FILL-ME imports (numpy, SoapySDR -> pyusb
+#                             as `usb`) can never hit our sibling usb.py/power.py
 
 usb = usb_sdrs()
 soapy = soapy_devices()          # None = SoapySDR not installed; [] = installed, none found

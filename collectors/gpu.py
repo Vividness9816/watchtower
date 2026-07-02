@@ -10,8 +10,9 @@ THROTTLE = {0x1: "idle", 0x2: "app_clocks", 0x4: "sw_power_cap", 0x8: "hw_slowdo
 
 
 def q(fields):
+    # 7s x up-to-3 calls = 21s worst case, safely under sysdiag's 25s kill switch
     r = subprocess.run([smi, f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
-                       capture_output=True, text=True, timeout=10)
+                       capture_output=True, text=True, timeout=7)
     if r.returncode != 0 or not r.stdout.strip():
         raise RuntimeError((r.stderr or r.stdout).strip()[:200] or f"nvidia-smi rc={r.returncode}")
     return [x.strip() for x in r.stdout.strip().splitlines()[0].split(",")]
@@ -43,12 +44,18 @@ try:
             break
         except Exception:
             continue
+    vram = round(100 * num(used) / num(total)) if num(used) is not None and num(total) else None
     print(json.dumps({"gpu": {
-        "util": i(u), "temp": i(t), "power": i(p),
-        "vram_pct": round(100 * float(used) / float(total)),
+        "util": i(u), "temp": i(t), "power": i(p), "vram_pct": vram,
         "fan_pct": i(fan), "pstate": pstate, "sm_mhz": i(sm), "sm_max_mhz": i(smmax),
         "power_limit": i(plim), "throttle": reasons,
         "pcie": {"gen": i(gen), "gen_max": i(genmax), "width": i(w), "width_max": i(wmax)},
     }}))
+except FileNotFoundError:
+    print(json.dumps({"gpu": {"present": False}}))  # no NVIDIA driver at all: a state, not an error
 except Exception as e:
-    print(json.dumps({"gpu": {"error": str(e)}}))   # no NVIDIA GPU = a finding, not a crash
+    msg = str(e)
+    if "No devices were found" in msg or "couldn't communicate" in msg:
+        print(json.dumps({"gpu": {"present": False}}))
+    else:
+        print(json.dumps({"gpu": {"error": msg}}))  # driver present but sick = a real finding

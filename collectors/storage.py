@@ -14,10 +14,12 @@ ps = (r"$drives=Get-PhysicalDisk | ForEach-Object {"
       r"StartTime=(Get-Date).AddDays(-1)} -EA SilentlyContinue|Measure-Object).Count;"
       r"[pscustomobject]@{drives=@($drives);events=$ev}|ConvertTo-Json -Compress -Depth 4")
 try:
+    # internal timeout must be SHORTER than sysdiag's 25s kill so our degrade path wins the race
     out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True, timeout=25).stdout.strip()
+                         capture_output=True, text=True, timeout=20).stdout.strip()
     d = json.loads(out)
     drives = d["drives"] if isinstance(d["drives"], list) else [d["drives"]]
+    drives = [x for x in drives if x]   # PS 5.1 wraps an empty pipeline as [null]
     print(json.dumps({"storage": {"drives": drives, "disk_events_24h": d["events"]}}))
 except Exception as e:
     print(json.dumps({"storage": {"error": str(e)}}))

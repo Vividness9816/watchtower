@@ -3,8 +3,13 @@
 # MaxClockSpeed * '% Processor Performance' (which runs >100% under turbo). Temp: sensors.py.
 import json, subprocess
 ps = (r"$c=Get-CimInstance Win32_Processor;"
-      r"$load=[int]((Get-Counter '\Processor(_Total)\% Processor Time' -EA SilentlyContinue)."
-      r"CounterSamples.CookedValue);"
+      # modern counter first (Task Manager semantics; survives legacy-counter corruption),
+      # legacy fallback, else an HONEST null — never a fabricated 0
+      r"$l=(Get-Counter '\Processor Information(_Total)\% Processor Utility' -EA SilentlyContinue)."
+      r"CounterSamples.CookedValue;"
+      r"if($null -eq $l){$l=(Get-Counter '\Processor(_Total)\% Processor Time' -EA SilentlyContinue)."
+      r"CounterSamples.CookedValue};"
+      r"$load=if($null -ne $l){[math]::Min(100,[int]$l)}else{$null};"
       r"$perf=(Get-Counter '\Processor Information(_Total)\% Processor Performance' "
       r"-EA SilentlyContinue).CounterSamples.CookedValue;"
       r"$max=($c.MaxClockSpeed|Measure-Object -Maximum).Maximum;"

@@ -10,8 +10,11 @@
 # Calibrate MARGIN_DB (start ~6 dB) and the floor against YOUR antenna/environment —
 # the floor is not a constant, sample it with the antenna terminated or at a quiet freq.
 import json, os, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)                     # only to reach _sdr_common under python -P...
 from _sdr_common import usb_sdrs, soapy_devices, absent
+sys.path.remove(_here)      # ...then off again, so FILL-ME imports (numpy, SoapySDR -> pyusb
+#                             as `usb`) can never hit our sibling usb.py/power.py
 
 MARGIN_DB = 6.0   # ponytail: fixed margin; make it per-channel if bands differ a lot
 

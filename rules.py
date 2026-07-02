@@ -6,7 +6,8 @@ THRESH = {
     "disk_pct":    (85, 95),
     "liquid_temp": (45, 55),   # AIO coolant; >55C the loop has lost the battle
     "drive_temp":  (70, 80),   # NVMe throttle band
-    "dns_ms":      (500, 2000),  # steady-state (cached) resolve; cold path is exempt
+    "dns_ms":      (500, 2000),  # steady-state (cached) resolve
+    "dns_cold_ms": (5000, 15000),  # resolver->upstream path; this LAN has shown 11s legit-slow
 }
 
 
@@ -47,10 +48,14 @@ def diagnose(snap: dict) -> list[dict]:
     if whea:
         out.append({"level": "CRIT", "what": "WHEA hardware errors", "value": whea, "limit": "", "unit": ""})
 
-    # cooling rule (a rule, not a reading): hot AND a stalled fan
+    # cooling rule (a rule, not a reading): hot AND the fan that matters is stalled.
+    # Unpopulated headers legitimately read 0 RPM forever, so judge only the CPU fan(s) —
+    # or a total stall (every reported fan at 0).
     cpu_temp = _get(snap, "sensors", "cpu_temp")
     fans = _get(snap, "sensors", "fans") or {}
-    if cpu_temp and cpu_temp >= 90 and fans and min(fans.values()) == 0:
+    cpu_fans = {k: v for k, v in fans.items() if "cpu" in k.lower()}
+    if cpu_temp and cpu_temp >= 90 and fans and (
+            (cpu_fans and min(cpu_fans.values()) == 0) or max(fans.values()) == 0):
         out.append({"level": "CRIT", "what": "cooling (hot + stalled fan)", "value": cpu_temp, "limit": "", "unit": "C"})
 
     # liquid cooling: coolant temp + pump-stalled-while-warm
@@ -81,6 +86,8 @@ def diagnose(snap: dict) -> list[dict]:
 
     # storage depth: error totals, drive temps, disk-subsystem event noise
     for d in _get(snap, "storage", "drives") or []:
+        if not isinstance(d, dict):     # PS 5.1 wraps an empty pipeline as [null]
+            continue
         errs = (d.get("read_errs") or 0) + (d.get("write_errs") or 0)
         if errs:
             out.append({"level": "WARN", "what": f"drive errors ({d.get('name')})",
@@ -105,6 +112,11 @@ def diagnose(snap: dict) -> list[dict]:
     if nic_errs:
         out.append({"level": "WARN", "what": "NIC packet errors", "value": nic_errs, "limit": "", "unit": ""})
     chk(_get(snap, "net", "dns_ms"), "dns_ms", "DNS resolve", "ms")
+    chk(_get(snap, "net", "dns_cold_ms"), "dns_cold_ms", "DNS cold resolve", "ms")
+    # resolver DEAD (dns_ms None while raw-IP ping works) = "internet up but nothing loads"
+    if "net" in snap and _get(snap, "net", "dns_ms") is None and _get(snap, "net", "ping_ms") is not None:
+        out.append({"level": "CRIT", "what": "DNS resolution (ping OK, resolve fails)",
+                    "value": "no answer", "limit": "", "unit": ""})
 
     # internet down
     if "net" in snap and _get(snap, "net", "ping_ms") is None:
@@ -114,6 +126,10 @@ def diagnose(snap: dict) -> list[dict]:
     for k, v in snap.items():
         if isinstance(v, dict) and "error" in v:
             out.append({"level": "WARN", "what": f"{k} sensor", "value": v["error"], "limit": "", "unit": ""})
+
+    # a collector that died outright (timeout/bad JSON) must surface too, not vanish
+    for msg in snap.get("_errors") or []:
+        out.append({"level": "WARN", "what": "collector failed", "value": msg, "limit": "", "unit": ""})
 
     return out
 
@@ -125,6 +141,18 @@ def demo():  # the one runnable check: a hot GPU MUST raise CRIT
     assert any("pump" in f["what"] for f in diagnose(stalled)), "pump rule broken"
     idle_pcie = {"gpu": {"util": 3, "pcie": {"gen": 1, "gen_max": 5, "width": 8, "width_max": 16}}}
     assert not any("PCIe" in f["what"] for f in diagnose(idle_pcie)), "idle PCIe must not flag"
+    loaded_pcie = {"gpu": {"util": 95, "pcie": {"gen": 1, "gen_max": 5, "width": 8, "width_max": 16}}}
+    assert any("PCIe" in f["what"] for f in diagnose(loaded_pcie)), "loaded PCIe must flag"
+    throttling = {"gpu": {"throttle": ["hw_thermal"]}}
+    assert any(f["level"] == "CRIT" and "slowdown" in f["what"] for f in diagnose(throttling)), "throttle rule broken"
+    bad_drive = {"storage": {"drives": [None, {"name": "X", "read_errs": 3, "write_errs": 0}]}}
+    assert any("drive errors" in f["what"] for f in diagnose(bad_drive)), "drive-error rule broken (or [null] crash)"
+    dead_dns = {"net": {"ping_ms": 12, "dns_ms": None}}
+    assert any("DNS resolution" in f["what"] for f in diagnose(dead_dns)), "dead-resolver rule broken"
+    unpopulated = {"sensors": {"cpu_temp": 95, "fans": {"CPU Fan": 1500, "System Fan #5": 0}}}
+    assert not any("cooling" in f["what"] for f in diagnose(unpopulated)), "empty header must not CRIT"
+    died = {"_errors": ["net.py: timeout"]}
+    assert any("collector failed" in f["what"] for f in diagnose(died)), "_errors must surface"
     print("rules ok")
 
 

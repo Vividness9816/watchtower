@@ -9,8 +9,11 @@
 # (then rx.py's power-above-floor check IS your Tx confirmation), or (b) a hardware
 # power meter. Wire whichever you pick into verify_emission() below.
 import json, os, sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _here)                     # only to reach _sdr_common under python -P...
 from _sdr_common import usb_sdrs, soapy_devices, absent
+sys.path.remove(_here)      # ...then off again, so FILL-ME imports (numpy, SoapySDR -> pyusb
+#                             as `usb`) can never hit our sibling usb.py/power.py
 
 if not usb_sdrs() and not soapy_devices():
     absent("tx")

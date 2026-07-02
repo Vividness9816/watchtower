@@ -14,8 +14,9 @@ ps = (r"$d7=(Get-Date).AddDays(-7);$d1=(Get-Date).AddDays(-1);"
       r" -EA SilentlyContinue|Measure-Object).Count;"
       r"[pscustomobject]@{dirty=$dirty;unexpected=$unex;throttle=$thr}|ConvertTo-Json -Compress")
 try:
+    # internal timeout must be SHORTER than sysdiag's 25s kill so our degrade path wins the race
     out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True, timeout=25).stdout.strip()
+                         capture_output=True, text=True, timeout=20).stdout.strip()
     d = json.loads(out)
     print(json.dumps({"power": {"dirty_reboots_7d": d["dirty"],
                                 "unexpected_shutdowns_7d": d["unexpected"],

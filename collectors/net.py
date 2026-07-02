@@ -1,7 +1,7 @@
 # collectors/net.py — ping 1.1.1.1 (stdlib) + link state + NIC error/discard counters
 # (Get-NetAdapterStatistics) + DNS resolve time (stdlib; catches a dead/slow Pi-hole
 # even when raw IP ping is fine — the classic "internet up but nothing loads").
-import json, subprocess, re, platform, socket, time
+import json, subprocess, re, platform, socket, time, threading
 
 
 def ping(host="1.1.1.1"):
@@ -14,18 +14,30 @@ def ping(host="1.1.1.1"):
         return None
 
 
-def dns_ms(name="example.com"):
-    t0 = time.perf_counter()
-    try:
-        socket.getaddrinfo(name, 443)
-        return int((time.perf_counter() - t0) * 1000)
-    except OSError:
-        return None                                   # resolution failing IS the signal
+def dns_ms(name="example.com", wait=13.0):
+    # getaddrinfo has no timeout knob and a dead resolver stalls it ~10-12s per call,
+    # which would blow sysdiag's 25s kill switch — so bound it with a daemon thread.
+    # wait=13 clears this LAN's measured worst legit cold resolve (~11s via Pi-hole).
+    res = {}
+
+    def _resolve():
+        t0 = time.perf_counter()
+        try:
+            socket.getaddrinfo(name, 443)
+            res["ms"] = int((time.perf_counter() - t0) * 1000)
+        except OSError:
+            res["ms"] = None                          # resolution failing IS the signal
+    th = threading.Thread(target=_resolve, daemon=True)
+    th.start()
+    th.join(wait)
+    return res.get("ms")                              # still running -> None (resolver sick)
 
 
-# first resolve exercises the cold path (Pi-hole -> upstream), second the cache;
-# a slow cold hit is normal-ish, a slow SECOND hit means the resolver itself is sick
-dns_cold, dns_warm = dns_ms(), dns_ms()
+def dns_pair():
+    # cold exercises the resolver->upstream path, warm the cache; skip warm if cold hung
+    cold = dns_ms()
+    warm = dns_ms(wait=6.0) if cold is not None else None
+    return cold, warm
 
 
 def link():
@@ -43,8 +55,19 @@ def link():
         return None
 
 
-lk = link() or {}
-print(json.dumps({"net": {"ping_ms": ping(), "target": "1.1.1.1",
+# run the three probes CONCURRENTLY so worst case is max(dns 19, link 10, ping 5) ~= 19s,
+# safely under sysdiag's 25s kill switch even with the resolver fully dead
+r = {}
+probes = [threading.Thread(target=lambda: r.__setitem__("dns", dns_pair()), daemon=True),
+          threading.Thread(target=lambda: r.__setitem__("lk", link()), daemon=True),
+          threading.Thread(target=lambda: r.__setitem__("ping", ping()), daemon=True)]
+for t in probes:
+    t.start()
+for t in probes:
+    t.join(21)
+dns_cold, dns_warm = r.get("dns") or (None, None)
+lk = r.get("lk") or {}
+print(json.dumps({"net": {"ping_ms": r.get("ping"), "target": "1.1.1.1",
                           "dns_ms": dns_warm, "dns_cold_ms": dns_cold,
                           "up": bool(lk.get("Name")), "name": lk.get("Name"),
                           "speed": lk.get("LinkSpeed"),
