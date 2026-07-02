@@ -20,7 +20,10 @@ WATCH_TOWER = """
 def cli_banner():
     """Print the banner in light blue with a full-width rule under it (terminal)."""
     width = shutil.get_terminal_size((100, 20)).columns
-    print(f"{LIGHT_BLUE}{WATCH_TOWER}\n{'─' * width}{RESET}")
+    try:
+        print(f"{LIGHT_BLUE}{WATCH_TOWER}\n{'─' * width}{RESET}")
+    except UnicodeEncodeError:      # redirected/cp1252 stdout can't draw box glyphs —
+        print("WATCH TOWER")        # a cosmetic banner must never kill the app
 
 
 def html_banner():
