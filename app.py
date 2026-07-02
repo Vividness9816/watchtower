@@ -28,8 +28,8 @@ def refresh_hosts(current):
 
 
 def stats_md(host) -> str:
-    live.set_focus(host)                    # keep chat focus synced to whatever the panel shows
-    snap, findings = context.snapshot_and_findings()
+    live.set_focus(host)                    # default for the host=None fallback path (CLI chat)
+    snap, findings = context.snapshot_and_findings(host)   # explicit host: no cross-tab clobber
     head = schema.summarize(snap)
     ident = snap.get("_host", host)
     label = snap.get("_label")
@@ -87,11 +87,15 @@ with gr.Blocks(title="Watch Tower") as app:
         with gr.Column(scale=2):
             gr.ChatInterface(
                 fn=brain.ask,
+                additional_inputs=[host_sel],   # the selected host reaches brain.ask -> context,
+                #                                 so the chat answers about the host you're viewing
                 title="Ask about the selected host",
-                examples=["Is anything overheating?",
-                          "What's eating my disk space?",
-                          "Are there any hardware errors?",
-                          "Any failed services or stopped VMs?"],
+                # list-of-lists (message + each additional input) is required once
+                # additional_inputs is set; host is left to default per example
+                examples=[["Is anything overheating?"],
+                          ["What's eating my disk space?"],
+                          ["Are there any hardware errors?"],
+                          ["Any failed services or stopped VMs?"]],
             )
     gr.Markdown("## Live graphs")
     with gr.Row():

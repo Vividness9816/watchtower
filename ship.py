@@ -10,9 +10,10 @@
 #   fast,full   which collectors go in each tier (full: null = the whole fleet)
 #   *_seconds   cadence;  narrate: attach the local NanoGPT report to full snapshots
 #   url         where to POST
-# Every key is overridable by an env var (env wins), so you can keep one config and vary
-# per-host with a single WATCHTOWER_HOST=... on the command line:
-#   WATCHTOWER_SHIP_URL  WATCHTOWER_TOKEN  WATCHTOWER_HOST  WATCHTOWER_SHIP_CONFIG
+# The identity/destination keys are env-overridable (env wins) so ONE shared config can serve
+# many machines by varying just these two on the command line — host via WATCHTOWER_HOST, url
+# via WATCHTOWER_SHIP_URL. Other keys (label/tags/fast/full/cadence/narrate) come from the file
+# (or --narrate). Also honoured: WATCHTOWER_TOKEN (secret), WATCHTOWER_SHIP_CONFIG (config path).
 #
 # `python ship.py --narrate` (or "narrate": true) runs the local NanoGPT narrator on each
 # FULL snapshot and ships its report as snap["_report"] (needs torch + ckpt.pt here; without
@@ -28,7 +29,11 @@ def load_config():
     cfg = {}
     try:
         with open(path, encoding="utf-8") as f:
-            cfg = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            cfg = {k: v for k, v in loaded.items() if not k.startswith("_")}
+        else:
+            print("ship.config.json ignored (not a JSON object)")   # a list/number/string
     except FileNotFoundError:
         pass                                    # config is optional; env + defaults suffice
     except (json.JSONDecodeError, OSError) as e:

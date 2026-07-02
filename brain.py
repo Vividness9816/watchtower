@@ -43,10 +43,12 @@ def _text(content):
     return "" if content is None else str(content)
 
 
-def ask(message, history):
-    """Gradio ChatInterface fn (type='messages'): history is [{role,content}, ...]."""
+def ask(message, history, host=None):
+    """Gradio ChatInterface fn (type='messages'): history is [{role,content}, ...].
+    host (from the GUI's host selector as an additional_input) picks which machine to answer
+    about; None (e.g. CLI chat.py) falls back to the sampler's focused/only host."""
     user_text = _text(message)
-    msgs = [{"role": "system", "content": SYSTEM.format(ctx=context.build(user_text))}]
+    msgs = [{"role": "system", "content": SYSTEM.format(ctx=context.build(user_text, host))}]
     msgs += [{"role": m["role"], "content": _text(m.get("content"))} for m in (history or [])]
     msgs.append({"role": "user", "content": user_text})
     body = json.dumps({"model": MODEL, "messages": msgs, "stream": False,

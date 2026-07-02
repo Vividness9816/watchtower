@@ -212,8 +212,10 @@ tell your machines apart:
 }
 ```
 
-Every key is overridable by an env var (env wins), so one config file plus a per-host
-`WATCHTOWER_HOST=...` on the command line is enough to vary identity across machines.
+The identity and destination are env-overridable (env wins) — `WATCHTOWER_HOST` for `host`,
+`WATCHTOWER_SHIP_URL` for `url` — so **one shared config file** plus a per-host
+`WATCHTOWER_HOST=...` on the command line is enough to vary which machine is reporting and
+where it ships. The other keys (label/tags/tiers/cadence) come from the file.
 
 **Multiple machines, one dashboard.** Each distinct `host` gets its **own** ring, snapshot,
 and findings — no cross-contamination. The GUI's **Host** selector (top of the page) lists

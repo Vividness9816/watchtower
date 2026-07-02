@@ -12,13 +12,15 @@ def _read(path):
         return ""
 
 
-def _snapshot() -> dict:
+def _snapshot(host=None) -> dict:
     # prefer the live sampler's cache (fresh within ~3 ticks) — a chat message then costs
     # zero collector runs; fall back to a one-shot snapshot when the sampler isn't running
-    # (CLI chat.py, sysdiag report) so behavior there is unchanged
+    # (CLI chat.py, sysdiag report) so behavior there is unchanged. `host` selects which
+    # machine's cache to read (the GUI passes the selected host explicitly, so concurrent
+    # tabs viewing different hosts never clobber each other via a shared global).
     try:
         import live
-        snap, age, full_age = live.get_latest()
+        snap, age, full_age = live.get_latest(host)
         # REMOTE mode: the cache is the ONLY truth — falling back to local collectors
         # would silently describe the monitoring computer instead of the monitored one.
         if live.REMOTE:
@@ -44,8 +46,8 @@ def _snapshot() -> dict:
                 "disk": {"C": 0}, "whea": {"recent_errors": 0}}
 
 
-def snapshot_and_findings():
-    snap = _snapshot()
+def snapshot_and_findings(host=None):
+    snap = _snapshot(host)
     try:
         return snap, rules.diagnose(snap)
     except Exception as e:
@@ -55,8 +57,8 @@ def snapshot_and_findings():
                        "value": f"could not evaluate snapshot: {e}", "limit": "", "unit": ""}]
 
 
-def build(message: str = "") -> str:
-    snap, findings = snapshot_and_findings()
+def build(message: str = "", host=None) -> str:
+    snap, findings = snapshot_and_findings(host)
     age, full_age = snap.get("_snapshot_age_s"), snap.get("_full_fleet_age_s")
     label = ("LIVE SNAPSHOT (JSON, just collected):" if age is None else
              f"LIVE SNAPSHOT (JSON; fast metrics ~{age}s old, "
@@ -73,7 +75,7 @@ def build(message: str = "") -> str:
     ]
     try:                                   # live trend digest, when the sampler is running
         import live
-        trend = live.deltas()
+        trend = live.deltas(host=host)
         if trend:
             parts += ["", "RECENT TRENDS (live-sampled, last 10 min):", trend]
     except Exception:

@@ -2,14 +2,22 @@
 # Reports running-service count + any FAILED units by name. Runs natively on a Linux host
 # (the Linux release) and, on a Windows host, bridges into WSL — exactly like k3s.py — so a
 # Windows box can still watch the systemd services inside its WSL distro. Degrades cleanly
-# when systemd is reachable nowhere.
+# when systemd is reachable nowhere (WSL1, no distro, systemd disabled).
+#
+# Two Windows gotchas this handles: (1) systemctl output is UTF-8 (the '●' status glyph is
+# 0xE2 0x97 0x8F) — we decode utf-8/replace, not the cp1252 locale codec, or a failed unit's
+# bullet crashes the decode. (2) `systemctl list-units` prints a leading '●' column for
+# troubled units — `--plain` drops it so we parse the real unit name.
 import json, os, shutil, subprocess
+
+# a real systemd `is-system-running` answer is one of these; anything else (command-not-found,
+# wsl's UTF-16 "no distribution" banner, empty) means systemd isn't actually reachable here
+VALID = {"running", "degraded", "maintenance", "starting", "stopping", "initializing"}
 
 
 def systemctl_base():
-    # native Linux with systemd?
     if os.name == "posix" and shutil.which("systemctl"):
-        return ["systemctl"]
+        return ["systemctl"]                        # native Linux with systemd
     # Windows (or no native systemd): try WSL, where modern WSL2 runs systemd if enabled.
     # ADJUST like k3s.py if your distro isn't the default: prepend ["wsl","-d","Ubuntu",...]
     if shutil.which("wsl"):
@@ -18,9 +26,10 @@ def systemctl_base():
 
 
 def run(base, *args):
-    r = subprocess.run(base + list(args) + ["--no-pager", "--no-legend"],
-                       capture_output=True, text=True, timeout=20)
-    return r.stdout
+    r = subprocess.run(base + list(args) + ["--plain", "--no-pager", "--no-legend"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       timeout=20)
+    return r.stdout or ""
 
 
 base = systemctl_base()
@@ -28,11 +37,11 @@ try:
     if not base:
         print(json.dumps({"services": {"present": False}}))   # no systemd anywhere reachable
         raise SystemExit
-    # is systemd actually up? (WSL without systemd, or a container, answers 'offline'/errors)
-    probe = subprocess.run(base + ["is-system-running"], capture_output=True, text=True, timeout=15)
-    status = (probe.stdout or probe.stderr).strip()
-    if probe.returncode != 0 and status in ("offline", "unknown", ""):
-        print(json.dumps({"services": {"present": False, "note": f"systemd not running ({status})"}}))
+    probe = subprocess.run(base + ["is-system-running"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=15)
+    status = (probe.stdout or "").strip()
+    if status not in VALID:            # command-not-found / no-distro / WSL1 / systemd disabled
+        print(json.dumps({"services": {"present": False, "note": f"systemd not reachable ({status or 'no answer'})"}}))
         raise SystemExit
     running = [ln.split()[0] for ln in run(base, "list-units", "--type=service",
                                            "--state=running").splitlines() if ln.strip()]
