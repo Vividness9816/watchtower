@@ -153,7 +153,7 @@ context.py brain.py                                    # Ollama chat brain
 art.py trends.py live.py app.py chat.py                # UI / CLI + live sampler
 system_facts.md  requirements.txt  .gitignore
 collectors/   cpu mem disk gpu sensors net docker k3s whea tpm me usb storage
-              lights power vm services                 # RGB + boot forensics + Hyper-V VMs + systemd
+              lights power vm services ssh             # RGB + boot forensics + Hyper-V + systemd + remote-VM SSH
               sdr rx tx tuner antenna  _sdr_common     # SDR/antenna skeletons (fill when hardware lands)
 docs/         RECREATE-WINDOWS.md  RECREATE-LINUX.md
 # generated (git-ignored): corpus.txt* vocab.json ckpt.pt history.db   (*corpus is deterministic)
@@ -244,6 +244,22 @@ The SDR skeletons (`sdr/rx/tx/tuner/antenna.py`) run today and emit `present:fal
 `FILL-ME` blocks document the intended probes to complete when hardware arrives — `antenna.py`
 covers the selected antenna port, its options, RSSI, and (where a TX-capable chain with a
 return-loss bridge exposes it) SWR.
+
+**Remote Linux VMs over SSH.** `ssh.py` scrapes components that live on other Linux boxes by
+SSHing in and running read-only checks — a check is a shell command, so **reading a file is
+just `cat`/`grep /path`**. It shells out to the OpenSSH client (already on Win11/Linux) like
+`k3s.py` shells to `wsl`; configure targets in `ssh.config.json` (copy the example; the real
+file is gitignored). Each target opens **one** SSH session (all its checks run in it) and
+targets run in parallel, so an unreachable VM degrades instead of hanging the fleet.
+Key-based auth only — set up an SSH key first (`ssh-copy-id`); passwords are disabled
+(`BatchMode`), and host-key checking stays on (a new VM must be in `known_hosts`, or set
+`"accept_new": true` for trust-on-first-use). Optional `"jump"` routes through a bastion
+(`ProxyJump`). A check can carry `warn`/`crit`/`unit` thresholds: numeric results are
+threshold-checked into findings, an unreachable target is a WARN, and every scraped value
+lands in the snapshot so the chat brain can reason about it ("is the db VM's disk filling
+up?"). Runs in the 60s full tier — comfortable for a modest fleet; large fleets want a
+trimmed `full` list or a longer collector timeout. Example check with a threshold:
+`"disk_root_pct": { "cmd": "df --output=pcent / | tail -1 | tr -dc 0-9", "warn": 85, "crit": 95, "unit": "%" }`.
 
 **Virtual machines & services.** `vm.py` reports Hyper-V VMs and their **encryption posture**
 (EncryptStateAndVmMigrationTraffic, virtual TPM, Secure Boot, Shielded) plus running/encrypted

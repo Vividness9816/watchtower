@@ -1,0 +1,34 @@
+{
+  "_comment": "Collector: SSH into remote Linux VMs and scrape read-only checks. Copy to ssh.config.json (gitignored). KEY-BASED AUTH ONLY — set up an SSH key to each VM first (ssh-copy-id); passwords are disabled. A new VM must be in known_hosts, or set accept_new:true for trust-on-first-use. Reading a file = a check whose cmd is `cat`/`grep /path`.",
+
+  "connect_timeout": 6,
+
+  "targets": [
+    {
+      "name": "db-vm",
+      "ssh": "monitor@10.0.0.5",
+      "port": 22,
+      "key": "~/.ssh/id_ed25519",
+      "accept_new": false,
+      "jump": "monitor@bastion.example",
+      "checks": {
+        "disk_root_pct":  { "cmd": "df --output=pcent / | tail -1 | tr -dc 0-9", "warn": 85, "crit": 95, "unit": "%" },
+        "load1":          { "cmd": "cut -d' ' -f1 /proc/loadavg", "warn": 8, "crit": 16 },
+        "mem_used_pct":   { "cmd": "free | awk '/Mem:/ {printf \"%d\", $3/$2*100}'", "warn": 90, "crit": 97, "unit": "%" },
+        "postgres":       "systemctl is-active postgresql",
+        "cert_days_left": { "cmd": "echo $(( ( $(date -d \"$(openssl x509 -enddate -noout -in /etc/ssl/certs/site.pem | cut -d= -f2)\" +%s) - $(date +%s) ) / 86400 ))", "warn": 30, "crit": 7, "unit": "d" },
+        "app_debug_on":   "grep -c '^DEBUG=true' /etc/myapp/config.env || true",
+        "last_backup_age_h": { "cmd": "echo $(( ( $(date +%s) - $(stat -c %Y /var/backups/db.sql.gz) ) / 3600 ))", "warn": 26, "crit": 50, "unit": "h" }
+      }
+    },
+    {
+      "name": "web-vm",
+      "ssh": "monitor@10.0.0.6",
+      "checks": {
+        "nginx":         "systemctl is-active nginx",
+        "http_health":   "curl -s -o /dev/null -w '%{http_code}' http://localhost/health",
+        "open_fds_pct":  { "cmd": "awk '{print int($1/$3*100)}' /proc/sys/fs/file-nr 2>/dev/null || echo 0", "warn": 80, "crit": 95, "unit": "%" }
+      }
+    }
+  ]
+}

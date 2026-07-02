@@ -34,6 +34,10 @@ nvidia-smi.md
 .env
 .env.*
 
+# Per-machine agent configs (real ones carry hostnames/keys/topology; keep the *.example.json)
+ship.config.json
+ssh.config.json
+
 # OS cruft
 Thumbs.db
 .DS_Store

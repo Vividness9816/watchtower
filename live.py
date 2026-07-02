@@ -38,6 +38,7 @@ METRICS = {
     "VMs running":      ("vm", "running"),
     "Services failed":  ("services", "failed"),
     "Services running": ("services", "running"),
+    "SSH targets down": ("ssh", "down"),
 }
 # labels backed by FAST-tier collectors get a fresh point every tick; the rest only when
 # the full fleet runs — recording them per-tick would fake 12 duplicate samples per real one

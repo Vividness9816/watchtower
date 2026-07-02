@@ -118,6 +118,25 @@ def diagnose(snap: dict) -> list[dict]:
         out.append({"level": "CRIT" if failed >= 3 else "WARN", "what": "failed services",
                     "value": names or failed, "limit": "", "unit": ""})
 
+    # remote SSH-scraped VMs: unreachable target -> WARN; each check carries its own thresholds
+    ssh_targets = _get(snap, "ssh", "targets")
+    if isinstance(ssh_targets, dict):
+        for tname, t in ssh_targets.items():
+            if not isinstance(t, dict):
+                continue
+            if t.get("reachable") is False:
+                out.append({"level": "WARN", "what": f"SSH target unreachable ({tname})",
+                            "value": t.get("error", "no reply"), "limit": "", "unit": ""})
+                continue
+            for cname, c in (t.get("checks") or {}).items():
+                if not isinstance(c, dict) or not isinstance(c.get("value"), (int, float)):
+                    continue
+                v, warn, crit, unit = c["value"], c.get("warn"), c.get("crit"), c.get("unit", "")
+                if crit is not None and v >= crit:
+                    out.append({"level": "CRIT", "what": f"{tname}:{cname}", "value": v, "limit": crit, "unit": unit})
+                elif warn is not None and v >= warn:
+                    out.append({"level": "WARN", "what": f"{tname}:{cname}", "value": v, "limit": warn, "unit": unit})
+
     # NIC errors + sick resolver (cached lookups slow = resolver itself is unhealthy)
     nic_errs = (_get(snap, "net", "rx_errors") or 0) + (_get(snap, "net", "tx_errors") or 0)
     if nic_errs:
@@ -166,6 +185,12 @@ def demo():  # the one runnable check: a hot GPU MUST raise CRIT
     assert any("collector failed" in f["what"] for f in diagnose(died)), "_errors must surface"
     svc = {"services": {"failed": 2, "failed_units": ["nginx.service", "sshd.service"]}}
     assert any("failed services" in f["what"] and "nginx" in str(f["value"]) for f in diagnose(svc)), "service rule broken"
+    ssh_snap = {"ssh": {"targets": {
+        "db-vm": {"reachable": True, "checks": {"disk_root_pct": {"value": 96, "warn": 85, "crit": 95, "unit": "%"}}},
+        "web-vm": {"reachable": False, "error": "timeout"}}}}
+    sf = diagnose(ssh_snap)
+    assert any(f["level"] == "CRIT" and "db-vm:disk_root_pct" in f["what"] for f in sf), "ssh threshold rule broken"
+    assert any("unreachable (web-vm)" in f["what"] for f in sf), "ssh unreachable rule broken"
     print("rules ok")
 
 
