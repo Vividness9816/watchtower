@@ -13,12 +13,30 @@ if gr.NO_RELOAD:   # guard: `gradio app.py` reload mode re-imports modules — w
 #                UI spawns the collector fleet per tick anymore.
 
 
-def stats_md() -> str:
+WAITING = "(waiting for data)"
+
+
+def refresh_hosts(current):
+    """Keep the host selector's choices current and point the chat at the visible host.
+    In local mode this is a single host; in remote mode new agents appear here live."""
+    hs = live.hosts()
+    if not hs:
+        return gr.update(choices=[WAITING], value=WAITING)
+    val = current if current in hs else hs[0]
+    live.set_focus(val)                     # the chat brain answers about the selected host
+    return gr.update(choices=hs, value=val)
+
+
+def stats_md(host) -> str:
+    live.set_focus(host)                    # keep chat focus synced to whatever the panel shows
     snap, findings = context.snapshot_and_findings()
     head = schema.summarize(snap)
+    ident = snap.get("_host", host)
+    label = snap.get("_label")
     age = snap.get("_snapshot_age_s")
     fresh = f" *(sampled {age}s ago)*" if age is not None else ""
-    lines = [f"### Live{fresh}\n{head}", "", "### Findings"]
+    title = f"### {ident}" + (f" — {label}" if label else "") + fresh
+    lines = [f"{title}\n{head}", "", "### Findings"]
     if findings:
         order = {"CRIT": 0, "WARN": 1}
         for f in sorted(findings, key=lambda x: order.get(x["level"], 9)):
@@ -28,6 +46,9 @@ def stats_md() -> str:
     d = snap.get("docker", {})
     if d and "error" not in d:
         lines.append(f"\n**Docker:** {d.get('running')}/{d.get('total')} running")
+    tags = snap.get("_tags")
+    if isinstance(tags, dict) and tags:
+        lines.append("\n" + " · ".join(f"`{k}={v}`" for k, v in tags.items()))
     if "_note" in snap:
         lines.append(f"\n> {snap['_note']}")
     return "\n".join(lines)
@@ -37,42 +58,52 @@ def plot(metric, rng):
     return trends.series(metric, rng)
 
 
+_init_hosts = live.hosts()
+_init_host = _init_hosts[0] if _init_hosts else WAITING
+
+
+def live_plot_component(sel, span, host):
+    # return a FULL component, not a bare DataFrame: the plot frontend freezes its
+    # series/color encoding from the first value it receives, so bare-value updates
+    # silently drop any series that wasn't present at page load (e.g. everything,
+    # when the page loads seconds after app start). Rebuilding the component each
+    # tick re-derives the encoding, so new series appear live.
+    return gr.LinePlot(live.frame(sel, span, host=host), x="time", y="value", color="series",
+                       title="Live (5s fast tier; net/whea/vm/services every 60s)", height=320)
+
+
+DEFAULT_SEL = ["CPU temp (C)", "GPU temp (C)", "Liquid temp (C)"]
+
 with gr.Blocks(title="Watch Tower") as app:
     gr.HTML(art.html_banner())
     gr.Markdown("# Watch Tower — your system, explained")
+    host_sel = gr.Dropdown(_init_hosts or [WAITING], value=_init_host, label="Host",
+                           info="which monitored machine to view (local mode: just this one)")
     with gr.Row():
         with gr.Column(scale=1):
-            panel = gr.Markdown(stats_md())
-            gr.Timer(5).tick(stats_md, outputs=panel)
+            panel = gr.Markdown(stats_md(_init_host))
+            gr.Timer(5).tick(refresh_hosts, inputs=host_sel, outputs=host_sel)
+            gr.Timer(5).tick(stats_md, inputs=host_sel, outputs=panel)
         with gr.Column(scale=2):
             gr.ChatInterface(
                 fn=brain.ask,
-                title="Ask about this machine",
+                title="Ask about the selected host",
                 examples=["Is anything overheating?",
                           "What's eating my disk space?",
                           "Are there any hardware errors?",
-                          "Is my GPU temp normal for this card?"],
+                          "Any failed services or stopped VMs?"],
             )
     gr.Markdown("## Live graphs")
-
-    def live_plot_component(sel, span):
-        # return a FULL component, not a bare DataFrame: the plot frontend freezes its
-        # series/color encoding from the first value it receives, so bare-value updates
-        # silently drop any series that wasn't present at page load (e.g. everything,
-        # when the page loads seconds after app start). Rebuilding the component each
-        # tick re-derives the encoding, so new series appear live.
-        return gr.LinePlot(live.frame(sel, span), x="time", y="value", color="series",
-                           title="Live (5s fast tier; net/whea every 60s)", height=320)
-
-    DEFAULT_SEL = ["CPU temp (C)", "GPU temp (C)", "Liquid temp (C)"]
     with gr.Row():
         live_sel = gr.Dropdown(list(live.METRICS), multiselect=True, label="Metrics",
                                value=DEFAULT_SEL)
         live_span = gr.Dropdown(list(live.SPANS), value="15 min", label="Window")
-    live_plot = live_plot_component(DEFAULT_SEL, "15 min")
-    gr.Timer(5).tick(live_plot_component, inputs=[live_sel, live_span], outputs=live_plot)
-    live_sel.change(live_plot_component, [live_sel, live_span], live_plot)
-    live_span.change(live_plot_component, [live_sel, live_span], live_plot)
+    live_plot = live_plot_component(DEFAULT_SEL, "15 min", _init_host)
+    gr.Timer(5).tick(live_plot_component, inputs=[live_sel, live_span, host_sel], outputs=live_plot)
+    live_sel.change(live_plot_component, [live_sel, live_span, host_sel], live_plot)
+    live_span.change(live_plot_component, [live_sel, live_span, host_sel], live_plot)
+    host_sel.change(stats_md, host_sel, panel)
+    host_sel.change(live_plot_component, [live_sel, live_span, host_sel], live_plot)
 
     gr.Markdown("## History")
     with gr.Row():

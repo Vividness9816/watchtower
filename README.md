@@ -153,8 +153,8 @@ context.py brain.py                                    # Ollama chat brain
 art.py trends.py live.py app.py chat.py                # UI / CLI + live sampler
 system_facts.md  requirements.txt  .gitignore
 collectors/   cpu mem disk gpu sensors net docker k3s whea tpm me usb storage
-              lights power                             # RGB state (OpenRGB) + boot forensics
-              sdr rx tx tuner  _sdr_common             # SDR skeletons (fill when hardware lands)
+              lights power vm services                 # RGB + boot forensics + Hyper-V VMs + systemd
+              sdr rx tx tuner antenna  _sdr_common     # SDR/antenna skeletons (fill when hardware lands)
 docs/         RECREATE-WINDOWS.md  RECREATE-LINUX.md
 # generated (git-ignored): corpus.txt* vocab.json ckpt.pt history.db   (*corpus is deterministic)
 ```
@@ -185,7 +185,7 @@ machine and run
 # on the MONITORED machine (agent) — add --narrate to ship NanoGPT reports too
 set WATCHTOWER_SHIP_URL=http://<nifi-or-gui-host>:8081/watchtower
 set WATCHTOWER_TOKEN=<shared-secret>
-set WATCHTOWER_HOST=lab-pc        # optional: payload hostname (default: this machine's name)
+set WATCHTOWER_HOST=lab-pc        # optional: identity in the payload (default: this machine's name)
 python ship.py
 
 # on the MONITORING machine (GUI)
@@ -195,12 +195,36 @@ set WATCHTOWER_INGEST_BIND=0.0.0.0:7861   # optional: receiver bind (default). U
 python app.py                             #   if NiFi runs on the same box and nothing else should reach it
 ```
 
-`ship.py` streams JSON snapshots on the same two-tier cadence (fast 5s `{"partial": true}`,
-full fleet 60s); the GUI's receiver (`/ingest`, default `0.0.0.0:7861`, token required or it
-refuses to start) feeds the same ring/graphs/chat — in remote mode a stale feed is flagged
-`STALE` rather than ever sampling the monitoring machine. Point `WATCHTOWER_SHIP_URL`
-directly at `http://<gui-host>:7861/ingest` for the no-middleman setup, or route through
-**Apache NiFi** for buffering/provenance/fan-out — the minimal flow is two processors:
+**Per-machine config & identity — `ship.config.json`.** Copy `ship.config.example.json`
+to `ship.config.json` on each monitored box (or point `WATCHTOWER_SHIP_CONFIG` at one).
+This is where you shape the shipped JSON and, crucially, **name the reporter** so the GUI can
+tell your machines apart:
+
+```jsonc
+{
+  "host":  "lab-pc-01",                       // identity — how the GUI names/selects this box
+  "label": "Lab PC — rack 2, GPU node",       // friendly display label
+  "tags":  { "location": "basement", "role": "gpu-node" },   // free-form, shown on the panel
+  "fast":  ["cpu", "gpu", "mem", "sensors", "disk"],  // collectors in the 5s tier
+  "full":  null,                              // 60s tier: null = the whole fleet, or a list
+  "fast_seconds": 5, "full_seconds": 60, "narrate": false,
+  "url":   "http://nifi-or-gui-host:8081/watchtower"
+}
+```
+
+Every key is overridable by an env var (env wins), so one config file plus a per-host
+`WATCHTOWER_HOST=...` on the command line is enough to vary identity across machines.
+
+**Multiple machines, one dashboard.** Each distinct `host` gets its **own** ring, snapshot,
+and findings — no cross-contamination. The GUI's **Host** selector (top of the page) lists
+every machine reporting in; pick one and the stats panel, live graphs, and chat all switch to
+it (the chat answers about the selected host, with that host's findings). New agents appear in
+the selector live. `ship.py` streams JSON on the two-tier cadence (fast 5s `{"partial": true}`,
+full fleet 60s); the receiver (`/ingest`, default `0.0.0.0:7861`, token required or it refuses
+to start) feeds those per-host rings — a stale feed is flagged `STALE` rather than ever
+sampling the monitoring machine. Point `WATCHTOWER_SHIP_URL` directly at
+`http://<gui-host>:7861/ingest` for the no-middleman setup, or route through **Apache NiFi**
+for buffering/provenance/fan-out — the minimal flow is two processors:
 
 | processor | properties |
 |---|---|
@@ -209,14 +233,23 @@ directly at `http://<gui-host>:7861/ingest` for the no-middleman setup, or route
 
 Connect `ListenHTTP success -> InvokeHTTP`; NiFi's queue then absorbs GUI downtime
 (back-pressure + retry), records provenance per snapshot, and can tee the same stream to
-disk/Grafana/alerts with additional processors. One monitored host per GUI for now
-(the receiver is last-writer-wins; per-host rings when a second agent shows up).
+disk/Grafana/alerts with additional processors.
 
 **Bus discovery.** `python sysdiag.py discover` scans USB/PCI (PnP) + COM ports and maps known
 devices (SDRs, AIOs, RGB) to the collector that should cover them; add `--spawn` to write a stub
 collector for a recognized device that has none — the snapshot glob picks it up automatically.
-The SDR skeletons (`sdr/rx/tx/tuner.py`) run today and emit `present:false`; their `FILL-ME`
-blocks document the intended channel-power / PLL-lock probes to complete when hardware arrives.
+The SDR skeletons (`sdr/rx/tx/tuner/antenna.py`) run today and emit `present:false`; their
+`FILL-ME` blocks document the intended probes to complete when hardware arrives — `antenna.py`
+covers the selected antenna port, its options, RSSI, and (where a TX-capable chain with a
+return-loss bridge exposes it) SWR.
+
+**Virtual machines & services.** `vm.py` reports Hyper-V VMs and their **encryption posture**
+(EncryptStateAndVmMigrationTraffic, virtual TPM, Secure Boot, Shielded) plus running/encrypted
+counts — `present:false` when Hyper-V isn't installed (a WSL2-backend box, for instance).
+`services.py` reports **systemd** units — running count and any failed units by name — running
+natively on a Linux host and, on Windows, bridging into WSL exactly like `k3s.py` (so a Windows
+box still watches the services inside its WSL distro). A failed unit surfaces as a finding
+(WARN, or CRIT at 3+). Both degrade cleanly where the subsystem is absent.
 
 > **Linux note:** the Linux release swaps the PowerShell collectors for
 > psutil/lm-sensors/MCE equivalents and omits the Windows-only `tpm`/`me` collectors. The shared

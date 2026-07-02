@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy to ship.config.json on each MONITORED machine and edit. Env vars override any key here. This is where you set the reporter's identity and shape the shipped JSON.",
+
+  "host": "lab-pc-01",
+  "label": "Lab PC — rack 2, GPU node",
+  "tags": { "location": "basement", "role": "gpu-node", "owner": "dylan" },
+
+  "fast": ["cpu", "gpu", "mem", "sensors", "disk"],
+  "full": null,
+
+  "fast_seconds": 5,
+  "full_seconds": 60,
+
+  "narrate": false,
+
+  "url": "http://nifi-or-gui-host:8081/watchtower"
+}

@@ -110,6 +110,14 @@ def diagnose(snap: dict) -> list[dict]:
     if thr:
         out.append({"level": "WARN", "what": "CPU throttle events (24h)", "value": thr, "limit": "", "unit": ""})
 
+    # systemd: a failed unit is a clear signal; name the units so the fix is obvious
+    failed = _get(snap, "services", "failed")
+    if failed:
+        units = _get(snap, "services", "failed_units") or []
+        names = ", ".join(str(u) for u in units[:5]) if isinstance(units, list) else ""
+        out.append({"level": "CRIT" if failed >= 3 else "WARN", "what": "failed services",
+                    "value": names or failed, "limit": "", "unit": ""})
+
     # NIC errors + sick resolver (cached lookups slow = resolver itself is unhealthy)
     nic_errs = (_get(snap, "net", "rx_errors") or 0) + (_get(snap, "net", "tx_errors") or 0)
     if nic_errs:
@@ -156,6 +164,8 @@ def demo():  # the one runnable check: a hot GPU MUST raise CRIT
     assert not any("cooling" in f["what"] for f in diagnose(unpopulated)), "empty header must not CRIT"
     died = {"_errors": ["net.py: timeout"]}
     assert any("collector failed" in f["what"] for f in diagnose(died)), "_errors must surface"
+    svc = {"services": {"failed": 2, "failed_units": ["nginx.service", "sshd.service"]}}
+    assert any("failed services" in f["what"] and "nginx" in str(f["value"]) for f in diagnose(svc)), "service rule broken"
     print("rules ok")
 
 
