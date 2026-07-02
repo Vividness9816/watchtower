@@ -13,6 +13,16 @@ def _read(path):
 
 
 def _snapshot() -> dict:
+    # prefer the live sampler's cache (fresh within ~3 ticks) — a chat message then costs
+    # zero collector runs; fall back to a one-shot snapshot when the sampler isn't running
+    # (CLI chat.py, sysdiag report) so behavior there is unchanged
+    try:
+        import live
+        snap, age = live.get_latest()
+        if snap and age < 3 * live.FAST_S:
+            return {**snap, "_snapshot_age_s": round(age, 1)}
+    except Exception:
+        pass
     try:
         import sysdiag
         return sysdiag.snapshot()
@@ -40,6 +50,13 @@ def build(message: str = "") -> str:
         "FINDINGS (deterministic ground truth from rules.py — trust these over guesses):",
         json.dumps(findings, indent=2) if findings else "none — all nominal",
     ]
+    try:                                   # live trend digest, when the sampler is running
+        import live
+        trend = live.deltas()
+        if trend:
+            parts += ["", "RECENT TRENDS (live-sampled, last 10 min):", trend]
+    except Exception:
+        pass
     refs = rag.context_block(message)      # semantic retrieval replaces the keyword gate
     if refs:
         parts += ["", refs]

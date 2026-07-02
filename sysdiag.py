@@ -4,9 +4,14 @@ HERE = pathlib.Path(__file__).parent
 
 
 def snapshot(only=None) -> dict:
+    """only: None = all collectors, "name" = one, ["a","b"] = a subset (live.py fast tier)."""
     snap = {}
-    pattern = str(HERE / "collectors" / (f"{only}.py" if only else "*.py"))
-    files = [f for f in sorted(glob.glob(pattern))
+    if only and not isinstance(only, str):
+        files = [str(HERE / "collectors" / f"{n}.py") for n in sorted(only)]
+    else:
+        pattern = str(HERE / "collectors" / (f"{only}.py" if only else "*.py"))
+        files = sorted(glob.glob(pattern))
+    files = [f for f in files
              if not pathlib.Path(f).name.startswith("_")]   # _*.py = shared libs, not collectors
 
     def run_one(f):

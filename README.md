@@ -150,7 +150,7 @@ No env vars, no secrets. Tune these in source:
 schema.py rules.py data.py gpt.py train.py infer.py   # tiny GPT
 sysdiag.py history.py discover.py                      # truth layer + logger + bus discovery
 context.py brain.py                                    # Ollama chat brain
-art.py trends.py app.py chat.py                        # UI / CLI
+art.py trends.py live.py app.py chat.py                # UI / CLI + live sampler
 system_facts.md  requirements.txt  .gitignore
 collectors/   cpu mem disk gpu sensors net docker k3s whea tpm me usb storage
               lights power                             # RGB state (OpenRGB) + boot forensics
@@ -166,6 +166,14 @@ CAM or run LHM). `gpu.py` adds decoded throttle reasons, PCIe link gen/width cur
 fan %, P-state and clocks. `power.py` counts Kernel-Power 41 / 6008 / throttle events — the
 software-visible shadow of the board's debug LEDs (which are POST-time hardware and unreadable).
 `lights.py` reads actual RGB zone state through the OpenRGB SDK server.
+
+**Live sampling.** `live.py` runs a background sampler inside the app: cheap collectors
+(cpu/gpu/mem/sensors/disk) every 5s, the full fleet every 60s, kept in a ~1h in-memory ring.
+The dashboard's stats panel, the **Live graphs** section (multi-select metrics, 5/15/60-min
+window, 5s refresh) and the chat brain all read this cache — a chat message costs zero
+collector runs and the LLM context carries the fresh snapshot (age-stamped) plus a
+`RECENT TRENDS` digest of the last 10 minutes. Long-term history stays with
+`history.py`/Task Scheduler and the History graphs.
 
 **Bus discovery.** `python sysdiag.py discover` scans USB/PCI (PnP) + COM ports and maps known
 devices (SDRs, AIOs, RGB) to the collector that should cover them; add `--spawn` to write a stub
