@@ -8,3 +8,8 @@ sqlite-vec   # vector store for rag.py (see RECREATE-WINDOWS.md / RECREATE-LINUX
 
 # Linux ONLY — the Linux collectors use psutil instead of PowerShell/CIM. Uncomment on Linux:
 # psutil
+
+# OPTIONAL deep-sensor deps — every collector degrades gracefully without them:
+# liquidctl       # AIO liquid temp / pump RPM fallback when LHM is down (sensors.py)
+# openrgb-python  # RGB zone state via the OpenRGB SDK server (lights.py)
+# SoapySDR is NOT pip-installable on Windows — it ships with radioconda/PothosSDR (sdr/rx/tx/tuner.py)
