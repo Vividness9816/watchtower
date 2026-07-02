@@ -176,6 +176,40 @@ back to a one-shot snapshot only if the cache is stale) and the LLM context carr
 snapshot with per-tier age stamps plus a `RECENT TRENDS` digest of the last 10 minutes.
 Long-term history stays with `history.py`/Task Scheduler and the History graphs.
 
+**Remote monitoring (one machine watches another).** Collectors must run on the monitored
+box; the GUI/rules/chat run on the monitoring box; the NanoGPT narrator can sit on either.
+The agent side is stdlib-only: copy `collectors/ sysdiag.py ship.py` to the monitored
+machine and run
+
+```
+# on the MONITORED machine (agent) — add --narrate to ship NanoGPT reports too
+set WATCHTOWER_SHIP_URL=http://<nifi-or-gui-host>:8081/watchtower
+set WATCHTOWER_TOKEN=<shared-secret>
+python ship.py
+
+# on the MONITORING machine (GUI)
+set WATCHTOWER_REMOTE=1
+set WATCHTOWER_TOKEN=<shared-secret>
+python app.py
+```
+
+`ship.py` streams JSON snapshots on the same two-tier cadence (fast 5s `{"partial": true}`,
+full fleet 60s); the GUI's receiver (`/ingest`, default `0.0.0.0:7861`, token required or it
+refuses to start) feeds the same ring/graphs/chat — in remote mode a stale feed is flagged
+`STALE` rather than ever sampling the monitoring machine. Point `WATCHTOWER_SHIP_URL`
+directly at `http://<gui-host>:7861/ingest` for the no-middleman setup, or route through
+**Apache NiFi** for buffering/provenance/fan-out — the minimal flow is two processors:
+
+| processor | properties |
+|---|---|
+| `ListenHTTP` | Listening Port `8081`, Base Path `watchtower`, HTTP Headers to receive as Attributes `X-Watchtower-Token` |
+| `InvokeHTTP` | HTTP Method `POST`, URL `http://<gui-host>:7861/ingest`, Request Content-Type `application/json`, Attributes to Send `X-Watchtower-Token` |
+
+Connect `ListenHTTP success -> InvokeHTTP`; NiFi's queue then absorbs GUI downtime
+(back-pressure + retry), records provenance per snapshot, and can tee the same stream to
+disk/Grafana/alerts with additional processors. One monitored host per GUI for now
+(the receiver is last-writer-wins; per-host rings when a second agent shows up).
+
 **Bus discovery.** `python sysdiag.py discover` scans USB/PCI (PnP) + COM ports and maps known
 devices (SDRs, AIOs, RGB) to the collector that should cover them; add `--spawn` to write a stub
 collector for a recognized device that has none — the snapshot glob picks it up automatically.

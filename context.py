@@ -19,6 +19,16 @@ def _snapshot() -> dict:
     try:
         import live
         snap, age, full_age = live.get_latest()
+        # REMOTE mode: the cache is the ONLY truth — falling back to local collectors
+        # would silently describe the monitoring computer instead of the monitored one.
+        if live.REMOTE:
+            if not snap:
+                return {"_note": "remote mode: no snapshots received from the agent yet"}
+            out = {**snap, "_snapshot_age_s": round(min(age, 9999), 1),
+                   "_full_fleet_age_s": round(min(full_age, 9999), 1)}
+            if age > 3 * live.FAST_S:
+                out["_note"] = f"agent stopped shipping {round(age)}s ago — data is STALE"
+            return out
         if snap and age < 3 * live.FAST_S:
             return {**snap, "_snapshot_age_s": round(age, 1),
                     "_full_fleet_age_s": round(min(full_age, 9999), 1)}

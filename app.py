@@ -3,7 +3,11 @@ import gradio as gr
 import schema, brain, context, art, trends, live
 
 if gr.NO_RELOAD:   # guard: `gradio app.py` reload mode re-imports modules — without this,
-    live.start()   # every source edit would leak one more immortal sampler thread.
+    #              every source edit would leak one more immortal sampler thread.
+    if live.REMOTE:
+        live.start_receiver()   # monitoring another machine: data arrives via ship.py/NiFi
+    else:
+        live.start()            # monitoring THIS machine: local two-tier sampler
 #                Background sampler: fast metrics every 5s, full fleet every 60s. The stats
 #                panel, live graphs AND the chat brain all read its cache — nothing in the
 #                UI spawns the collector fleet per tick anymore.

@@ -2,10 +2,15 @@
 # Two tiers: FAST collectors every FAST_S seconds, the FULL fleet every FULL_S — so the
 # dashboard stays live without spawning 19 processes (10 of them PowerShell) every tick.
 # In-memory ring buffer only (~1h); long-term history stays with history.py/Task Scheduler.
-import threading, time, collections
+#
+# REMOTE mode (WATCHTOWER_REMOTE=1): instead of sampling THIS machine, run an HTTP
+# receiver and let a monitored machine push snapshots in (ship.py -> NiFi -> /ingest).
+# Same ring, same graphs, same chat context — only the data source changes.
+import hmac, json, os, threading, time, collections
 import pandas as pd
 import sysdiag
 
+REMOTE = os.environ.get("WATCHTOWER_REMOTE") == "1"
 FAST_S, FULL_S = 5, 60
 FAST = ["cpu", "gpu", "mem", "sensors", "disk"]     # cheap collectors, safe at 5s cadence
 KEEP = 3600 // FAST_S                               # ~1h of points
@@ -96,6 +101,52 @@ def start():
     _record(sysdiag.snapshot(), merge=False)
     _thread = threading.Thread(target=_loop, daemon=True, name="live-sampler")
     _thread.start()
+
+
+def start_receiver(bind=None, token=None):
+    """REMOTE mode: accept snapshots pushed by ship.py (directly or via NiFi InvokeHTTP).
+    POST /ingest, JSON {host, partial, snap}; X-Watchtower-Token header must match.
+    Merge is per-collector (top-level keys replace wholesale), so a partial payload must
+    carry COMPLETE collector objects for the collectors it includes — ship.py does."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    bind = bind or os.environ.get("WATCHTOWER_INGEST_BIND", "0.0.0.0:7861")
+    token = token or os.environ.get("WATCHTOWER_TOKEN", "")
+    if not token:
+        raise ValueError("REMOTE mode needs WATCHTOWER_TOKEN set — refusing an open listener")
+    host, port = bind.rsplit(":", 1)
+
+    class Ingest(BaseHTTPRequestHandler):
+        def _reply(self, code, msg=b""):
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+
+        def do_POST(self):
+            if self.path != "/ingest":
+                return self._reply(404)
+            if not hmac.compare_digest(self.headers.get("X-Watchtower-Token", ""), token):
+                return self._reply(403)
+            n = int(self.headers.get("Content-Length") or 0)
+            if not 0 < n <= 2_000_000:                       # a snapshot is ~50KB; cap abuse
+                return self._reply(413)
+            try:
+                p = json.loads(self.rfile.read(n))
+                snap = p["snap"]
+                if not isinstance(snap, dict):
+                    raise TypeError("snap must be an object")
+            except Exception:
+                return self._reply(400, b"bad payload")
+            snap["_host"] = str(p.get("host", "?"))[:64]      # ponytail: ONE monitored host —
+            _record(snap, merge=bool(p.get("partial")))       # last-writer-wins; per-host rings
+            self._reply(200, b"ok")                           # when a second agent shows up
+
+        def log_message(self, *_):                            # quiet: 12 req/min is not news
+            pass
+
+    srv = ThreadingHTTPServer((host, int(port)), Ingest)
+    threading.Thread(target=srv.serve_forever, daemon=True, name="live-ingest").start()
+    return srv
 
 
 def get_latest():
