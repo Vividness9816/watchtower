@@ -46,7 +46,13 @@ def _snapshot() -> dict:
 
 def snapshot_and_findings():
     snap = _snapshot()
-    return snap, rules.diagnose(snap)
+    try:
+        return snap, rules.diagnose(snap)
+    except Exception as e:
+        # REMOTE snapshots are semi-trusted JSON from another machine; a malformed field
+        # must not crash the 5s GUI panel / chat. Degrade to a single visible finding.
+        return snap, [{"level": "WARN", "what": "rules engine",
+                       "value": f"could not evaluate snapshot: {e}", "limit": "", "unit": ""}]
 
 
 def build(message: str = "") -> str:

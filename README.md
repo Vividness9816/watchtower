@@ -185,12 +185,14 @@ machine and run
 # on the MONITORED machine (agent) — add --narrate to ship NanoGPT reports too
 set WATCHTOWER_SHIP_URL=http://<nifi-or-gui-host>:8081/watchtower
 set WATCHTOWER_TOKEN=<shared-secret>
+set WATCHTOWER_HOST=lab-pc        # optional: payload hostname (default: this machine's name)
 python ship.py
 
 # on the MONITORING machine (GUI)
 set WATCHTOWER_REMOTE=1
 set WATCHTOWER_TOKEN=<shared-secret>
-python app.py
+set WATCHTOWER_INGEST_BIND=0.0.0.0:7861   # optional: receiver bind (default). Use 127.0.0.1:7861
+python app.py                             #   if NiFi runs on the same box and nothing else should reach it
 ```
 
 `ship.py` streams JSON snapshots on the same two-tier cadence (fast 5s `{"partial": true}`,

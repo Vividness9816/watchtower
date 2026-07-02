@@ -125,12 +125,15 @@ def start_receiver(bind=None, token=None):
         def do_POST(self):
             if self.path != "/ingest":
                 return self._reply(404)
-            if not hmac.compare_digest(self.headers.get("X-Watchtower-Token", ""), token):
-                return self._reply(403)
-            n = int(self.headers.get("Content-Length") or 0)
-            if not 0 < n <= 2_000_000:                       # a snapshot is ~50KB; cap abuse
-                return self._reply(413)
             try:
+                # header parses are inside the try: a non-ASCII token or non-numeric
+                # Content-Length must return a clean 4xx, not raise + reset the connection
+                got = self.headers.get("X-Watchtower-Token", "")
+                if not hmac.compare_digest(got.encode(), token.encode()):
+                    return self._reply(403)
+                n = int(self.headers.get("Content-Length") or 0)
+                if not 0 < n <= 2_000_000:                   # a snapshot is ~50KB; cap abuse
+                    return self._reply(413)
                 p = json.loads(self.rfile.read(n))
                 snap = p["snap"]
                 if not isinstance(snap, dict):

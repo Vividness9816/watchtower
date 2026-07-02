@@ -52,10 +52,13 @@ def diagnose(snap: dict) -> list[dict]:
     # Unpopulated headers legitimately read 0 RPM forever, so judge only the CPU fan(s) —
     # or a total stall (every reported fan at 0).
     cpu_temp = _get(snap, "sensors", "cpu_temp")
-    fans = _get(snap, "sensors", "fans") or {}
-    cpu_fans = {k: v for k, v in fans.items() if "cpu" in k.lower()}
-    if cpu_temp and cpu_temp >= 90 and fans and (
-            (cpu_fans and min(cpu_fans.values()) == 0) or max(fans.values()) == 0):
+    fans = _get(snap, "sensors", "fans")
+    fans = fans if isinstance(fans, dict) else {}   # remote JSON may send a non-dict; don't crash
+    cpu_fans = {k: v for k, v in fans.items()
+                if "cpu" in str(k).lower() and isinstance(v, (int, float))}
+    numeric = [v for v in fans.values() if isinstance(v, (int, float))]
+    if cpu_temp and cpu_temp >= 90 and numeric and (
+            (cpu_fans and min(cpu_fans.values()) == 0) or max(numeric) == 0):
         out.append({"level": "CRIT", "what": "cooling (hot + stalled fan)", "value": cpu_temp, "limit": "", "unit": "C"})
 
     # liquid cooling: coolant temp + pump-stalled-while-warm
