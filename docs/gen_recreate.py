@@ -439,6 +439,17 @@ stays populated.
 > Skip them; the shared `rules.py` simply sees no such keys. Linux analogues if you want them:
 > TPM via `/sys/class/tpm/`, uptime via `/proc/uptime`, security via `ufw`/`aa-status`, events via
 > `journalctl`. `procs.py` below is the Linux port (psutil); the rest of the fleet is native.
+
+> **Hardware-verification status.** These collectors were logic-tested in WSL (a real Linux
+> userland with **no** lm-sensors chips and **no** SMART-capable drives), so the hardware-shaped
+> parsing has not run against live silicon. The two parsers with real structure — `sensors.py`
+> (psutil/hwmon label matching for cpu_temp / liquid_temp / pump_rpm) and `storage.py`
+> (`smartctl --scan` + `smartctl -H -A -j` JSON) — are **fixture-tested** in the repo
+> (`tests/test_linux_parsers.py`) against realistic lm-sensors and smartmontools-JSON samples,
+> but remain **unverified on live hardware**: your chip's labels may differ (check `sensors`
+> output and adjust the match lists). The line-oriented scrapers (`whea.py`/`power.py` grep
+> journalctl text, `vm.py` parses `virsh list`) are trivially shaped but equally unverified on a
+> real MCE/libvirt box — treat first-run output on real hardware as something to eyeball once.
 """
 
 LINUX_CPU = '''# collectors/cpu.py (Linux) — core counts + live load via psutil.
@@ -599,8 +610,13 @@ try:
         r = sc("-H", "-A", "-j", dev)
         try:
             d = json.loads(r.stdout)
-            drives.append({"name": d.get("model_name", dev), "media": "SSD" if d.get("rotation_rate", 1) == 0 else "HDD",
-                           "health": "Healthy" if d.get("smart_status", {}).get("passed") else "Unknown",
+            # NVMe drives report NO rotation_rate key at all — protocol is the SSD signal there;
+            # SATA SSDs report rotation_rate 0. A failed SMART self-test must read "Failed"
+            # (rules.py's bad-health allow-list fires CRIT on it); "Unknown" only when absent.
+            ssd = d.get("device", {}).get("protocol") == "NVMe" or d.get("rotation_rate", 1) == 0
+            passed = d.get("smart_status", {}).get("passed")
+            drives.append({"name": d.get("model_name", dev), "media": "SSD" if ssd else "HDD",
+                           "health": {True: "Healthy", False: "Failed"}.get(passed, "Unknown"),
                            "temp": d.get("temperature", {}).get("current")})
         except Exception:
             drives.append({"name": dev, "health": "Unknown"})
