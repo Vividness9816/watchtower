@@ -43,9 +43,10 @@ collectors/*.py ──► sysdiag.py ──► snapshot{json} ──► rules.py
 - **Tiny GPT** — `schema.py` defines the exact metrics format; `data.py` synthesizes a training
   corpus; `gpt.py` is the transformer; `train.py` trains it; `infer.py` runs it.
 - **Chat brain** — `context.py` assembles the grounding context (static facts + live snapshot +
-  findings, with an optional homelab doc gated behind keywords); `brain.py` calls Ollama.
-- **UI** — `app.py` (Gradio web dashboard: live panel, chat, history graph) and `chat.py` (CLI).
-  `history.py` logs a snapshot to SQLite on a timer; `trends.py` reads it for the graph.
+  findings + a `RECENT TRENDS` digest, plus optional semantic doc retrieval via `rag.py`);
+  `brain.py` calls Ollama.
+- **UI** — `app.py` (Gradio: live panel, chat, live + history graphs, search, notes) and `chat.py`
+  (CLI). `history.py` logs a snapshot to SQLite on a timer; `trends.py`/`search.py` read it.
 
 ---
 
@@ -53,14 +54,14 @@ collectors/*.py ──► sysdiag.py ──► snapshot{json} ──► rules.py
 
 - 🔎 **Live findings** — thresholds per metric (`rules.py`), CPU/GPU temp, RAM, disk, WHEA/MCE
   hardware errors, stalled-fan + hot rule, internet-down.
-- 🧠 **From-scratch GPT** — a complete, readable ~10 M-param transformer (tokenizer → attention →
+- 🧠 **From-scratch GPT** — a complete, readable ~11 M-param transformer (tokenizer → attention →
   training loop → sampling) trained offline in minutes. Great for learning how GPTs work.
 - 💬 **Grounded chat** — a 32B model that cites your actual numbers and never invents readings;
   told it can only advise, never act.
 - 📊 **History graph + Search** — plot recent runs (hover any point for its date + time), and
   **search every logged snapshot by component, computer, or date/time**.
 - 📝 **Shared notes** — any user of the dashboard leaves a note the others see (SQLite-persistent).
-- 🧩 **Deep coverage** — 26 collectors: core hardware, rail voltages/power, SMART, boot forensics,
+- 🧩 **Deep coverage** — 28 collectors: core hardware, rail voltages/power, SMART, boot forensics,
   Docker/k3s (catches CrashLoopBackOff), Hyper-V, systemd, **OS posture** (uptime/microcode/
   pending-reboot/Secure Boot), **security** (Defender/firewall/BitLocker/VBS), **event-log health**
   (GPU TDR resets, NTFS corruption, failed scheduled tasks), top process consumers, and the WSL VM.
@@ -84,7 +85,7 @@ collectors/*.py ──► sysdiag.py ──► snapshot{json} ──► rules.py
   web server (port 8085); Linux → `lm-sensors`
 - *(optional)* **Docker** for the `docker`/`k3s` collectors
 
-Python deps (only three; everything else is stdlib): `torch`, `gradio`, `pandas` (+ `psutil` on Linux).
+Python deps (only four; everything else is stdlib): `torch`, `gradio`, `pandas`, `sqlite-vec` (+ `psutil` on Linux).
 
 ---
 
@@ -109,7 +110,7 @@ The short version:
 # 1. venv + deps  (Windows: python -m venv .venv ; .\.venv\Scripts\Activate.ps1)
 python -m venv .venv && source .venv/bin/activate
 pip install torch --index-url https://download.pytorch.org/whl/cu128   # match your CUDA
-pip install gradio pandas         # + psutil on Linux
+pip install gradio pandas sqlite-vec   # + psutil on Linux  (sqlite-vec powers the optional RAG)
 
 # 2. build & train the tiny GPT (writes ckpt.pt + vocab.json)
 python data.py 8000
@@ -174,6 +175,7 @@ system_facts.md  requirements.txt  .gitignore
 ship.config.example.json  ssh.config.example.json     # copy → *.config.json (gitignored) to configure
 collectors/   cpu mem disk gpu sensors net docker k3s whea tpm me usb storage
               lights power vm services ssh             # RGB + boot forensics + Hyper-V + systemd + remote-VM SSH
+              os security events procs wsl             # OS posture + Defender/firewall + event-log + top procs + WSL VM
               sdr rx tx tuner antenna  _sdr_common     # SDR/antenna skeletons (fill when hardware lands)
 docs/         INSTRUCTIONS.md  RECREATE-WINDOWS.md  RECREATE-LINUX.md  gen_recreate.py (generates the two RECREATE guides)
 # tracked for reproducibility: corpus.txt (deterministic) + vocab.json
