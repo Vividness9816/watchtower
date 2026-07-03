@@ -24,27 +24,36 @@ from sqlite_vec import serialize_float32
 OLLAMA_HOST  = "http://127.0.0.1:11434"
 OLLAMA_EMBED = OLLAMA_HOST + "/api/embed"        # batch endpoint (newer Ollama): {"input": [...]}
 OLLAMA_EMB1  = OLLAMA_HOST + "/api/embeddings"   # single endpoint (older Ollama): {"prompt": "..."}
-EMBED_MODEL  = "nomic-embed-text"                # `ollama pull nomic-embed-text` (~270 MB, CPU-ok)
+# mxbai-embed-large (1024-dim) measured best on this repo's frozen QA set: hit@5 0.939 / MRR@5
+# 0.792, a strict win over nomic-embed-text (0.909 / 0.774) on BOTH recall and ranking. Swap back
+# to "nomic-embed-text" (768-dim, ~270 MB, faster) if VRAM/pull size matters — retrieval degrades
+# only slightly. A model change rebuilds the index automatically (settings hash below).
+EMBED_MODEL  = "mxbai-embed-large"               # `ollama pull mxbai-embed-large` (~670 MB, CPU-ok)
 EMBED_BATCH  = 64                                # chunks sent per /api/embed request
 HERE = pathlib.Path(__file__).parent
 DB   = HERE / "rag_index.db"                     # generated cache — git-ignored
 
 # Docs to make searchable: EVERY *.md in this folder, plus the homelab notes (if present). Missing
 # files are skipped. Drop a new .md in here and the next `python rag.py --build` picks it up.
-SOURCES = [pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md", *sorted(HERE.glob("*.md"))]
+# Project meta-docs (this RSI log, the recreate/instruction guides) are NOT reference material —
+# excluded so they don't dilute a hardware/troubleshooting query.
+_EXCLUDE = {"RSI-REPORT.md"}
+SOURCES = [pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md",
+           *[p for p in sorted(HERE.glob("*.md")) if p.name not in _EXCLUDE]]
 
 # --- tuning knobs (the RAG equivalent of rules.THRESH — tune for YOUR docs) ---
-CHUNK_CHARS = 1200    # size of each searchable slice (~300 tokens)
-OVERLAP     = 200     # chars repeated between neighbours so a fact on a boundary isn't lost
+# 1600/400 measured best with mxbai on this corpus (see the model note above). Larger chunks then
+# hurt (facts get averaged out); smaller ones split answers across chunk boundaries.
+CHUNK_CHARS = 1600    # size of each searchable slice (~400 tokens)
+OVERLAP     = 400     # chars repeated between neighbours so a fact on a boundary isn't lost
 TOP_K       = 4       # how many chunks to return per question
 MIN_SCORE   = 0.45    # cosine floor; below this a chunk is "not really relevant" and is dropped
                       #   -> an off-topic question retrieves nothing. THIS is the knob to tune.
 
-# nomic-embed-text wants these task prefixes; they materially improve retrieval. Other embedders
-# differ: mxbai-embed-large wants only a query-side instruction and no document prefix. If unsure
-# for your model, set both to "" — it works, just slightly weaker on the query side.
-DOC_PREFIX   = "search_document: "
-QUERY_PREFIX = "search_query: "
+# mxbai-embed-large wants a query-side instruction and NO document prefix. (nomic-embed-text
+# instead wants "search_document: " / "search_query: " — swap both if you switch back.)
+DOC_PREFIX   = ""
+QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 
 def _log(msg: str) -> None:

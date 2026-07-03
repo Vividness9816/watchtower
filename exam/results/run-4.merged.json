@@ -1,0 +1,28 @@
+{
+ "run": 4,
+ "ts": "2026-07-02T22:07:11",
+ "dims_run": [
+  "s4"
+ ],
+ "dims_inherited": [
+  "s1",
+  "s2",
+  "s3",
+  "s5",
+  "s6",
+  "s7"
+ ],
+ "frozen_ok": true,
+ "scores": {
+  "s1": 0.8987,
+  "s2": 1.0,
+  "s3": 0.9931,
+  "s4": 0.7924,
+  "s5": 1.0,
+  "s6": 1.0,
+  "s7": 1.0
+ },
+ "composite": 0.9627,
+ "note": "retrieval: mxbai-embed-large 1600/400 (strict win on hit@5+MRR); exclude RSI-REPORT from corpus",
+ "seconds": 2.1
+}

@@ -1,0 +1,21 @@
+{
+ "run": 4,
+ "ts": "2026-07-02T22:07:11",
+ "frozen_ok": true,
+ "scores": {
+  "s4": 0.7924
+ },
+ "composite": null,
+ "detail": {
+  "s4": {
+   "mrr": 0.7924,
+   "hit_at_k": 0.9394,
+   "k": 5,
+   "n": 33,
+   "misses": [
+    "What does the passage provide instructions for?",
+    "What are the allocated resources for cpu and memory?"
+   ]
+  }
+ }
+}
