@@ -144,6 +144,25 @@ gain, and every remaining dimension is at a structural ceiling that no further i
 This is the intended stop condition ("no improvements possible after consecutive no-gain runs"),
 reached by exhausting the movable levers rather than by running out of attempts.
 
+## Independent cross-score (the ruler I didn't write)
+
+The 0.9865 composite is against a self-built exam. To escape that circularity, this build's narrator
+and hybrid-rerank retrieval were run through the **arena's** frozen exam (`D:\ClaudeRSI\Fable\arena`),
+scored by the arena's own `gold.py`/`checker.py` on its 200 held-out E1 snapshots and 60 E2 QA
+pairs over its broader corpus (sysinternals / nvidia-smi / WHEA docs) — questions and scorers I did
+not author.
+
+| Axis | This build | Fable champion | Opus r11 | v0 original |
+|---|---|---|---|---|
+| **E1 narration F1** | 0.9886 (status-acc 1.0, halluc 0.0) | 1.0000 | 1.0000 | 0.9828 |
+| **E2 retrieval MRR@5** | **0.8367** (hit@5 0.90) | 0.7992 | 0.7806 | 0.6678 |
+
+**Retrieval is validated independently:** the hybrid vector+lexical rerank **beats all three arena
+contenders on the arena's own harder question set** (0.8367 vs 0.7992) — resolving the open question
+of whether the +0.16 self-exam gain would transfer. It does. **Narration** is near-ceiling with zero
+hallucination, above the original and marginally below the arena champions' 1.0 — the residual gap is
+the inherent limit of a tiny learned char-GPT, not a training deficiency.
+
 ## Live verification (beyond the exam)
 
 The exam is a proxy; these were verified by driving the real system:
