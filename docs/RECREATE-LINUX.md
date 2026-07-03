@@ -30,8 +30,21 @@ collectors/*.py ──► sysdiag.py ──► snapshot{json} ──► rules.py
   schema.serialize ─► tiny GPT   context.build ─► brain.ask ─► Ollama   live.py ring ─► graphs
 ```
 
-Two independent "AIs": the **tiny GPT you train** (offline, ~44 MB) and the **32B Ollama model**
-(downloaded, ~19 GB). They are separate — run the dashboard with either, both, or neither.
+Two independent "AIs": the **tiny GPT you train** (offline, ~47 MB checkpoint, ~11 M params) and
+the **Ollama chat model** (downloaded, e.g. `qwen2.5:32b` ~19 GB — see §7 for the model matrix).
+They are separate — run the dashboard with either, both, or neither.
+
+Beyond the health panel the dashboard has: a **Host** selector (local, or many remote machines),
+**live graphs** and a **History graph**, a **Search** box (find any logged metric by component,
+computer, or date/time), and **shared Notes** (any user of the instance leaves notes the others
+see). A `sysdiag.py` run also returns a severity **exit code** (0 clean / 1 WARN / 2 CRIT) so
+Task Scheduler or CI can detect machine distress without parsing text.
+
+> **Network honesty:** Watch Tower is local-first (dashboard binds `127.0.0.1`, Ollama is local,
+> no API keys), but it is **not** zero-egress: `collectors/net.py` pings `1.1.1.1` and resolves a
+> DNS name over the internet each full-fleet cycle to measure connectivity, and remote mode streams
+> snapshots to the monitoring host. Everything else stays on the box. Delete/relax `net.py` if you
+> want a truly offline build.
 
 Beyond the basics this build includes: deep sensors (VRM/NVMe temps, AIO liquid temp, GPU
 throttle/PCIe), boot/power forensics, RGB state, Hyper-V/libvirt VM encryption posture, systemd
@@ -71,6 +84,17 @@ mkdir -p ~/sysdiag/collectors ~/sysdiag/docs && cd ~/sysdiag
 These files build, train, and run a character-level transformer with zero downloads. They are
 **identical across Windows and Linux** (pure Python + torch).
 
+**How to train the narrator** (details in §6.3): `data.py` synthesizes a deterministic corpus of
+`INPUT metrics → REPORT` documents from random-but-seeded snapshots (seed 1337, so `corpus.txt` is
+byte-reproducible); `gpt.py` is the ~11 M-param model (6 layers, 384-dim, `block_size=512` — large
+enough that the longest report fits the attention window so multi-finding reports aren't truncated
+mid-sentence); `train.py` runs ~3 min on a modern GPU (or ~20–30 min CPU) to val-loss ≈ 0.19 and
+writes `ckpt.pt` (~47 MB) + `vocab.json`; `infer.py --demo` shows INPUT / rule-truth / model-output
+side by side. **Retrain when** you change `schema.serialize_metrics`, `data.render_report`, or the
+corpus size — the model input/label contract changed. You do **not** need to retrain to add
+collectors or rules that the narrator's 10-metric input doesn't include (those surface via the
+rules engine and chat brain instead).
+
 ### `schema.py`
 
 ```python
@@ -91,23 +115,40 @@ def _g(snap, *path, default=0):
     return cur
 
 
+def _i(snap, *path):
+    """int() of a dug metric, but SAFE: a hostile non-numeric leaf (list/dict/str from a sick or
+    spoofed remote collector) coerces to 0 instead of raising — summarize()/serialize feed the UI
+    panel and the model, and must never crash on a malformed snapshot. Identical to int(_g(...))
+    for the normal numeric case, so the training corpus is unchanged."""
+    import math
+    v = _g(snap, *path)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return 0
+    if isinstance(v, float) and not math.isfinite(v):     # NaN/inf from a sick collector -> 0
+        return 0
+    return int(v)
+
+
 def serialize_metrics(snap: dict) -> str:
     """The exact INPUT text the model trains and runs on. Keep it stable forever."""
     return "\n".join([
-        f"cpu_load={int(_g(snap,'cpu','load'))} cpu_temp={int(_g(snap,'sensors','cpu_temp'))} "
-        f"mem_pct={int(_g(snap,'mem','pct'))}",
-        f"gpu_util={int(_g(snap,'gpu','util'))} gpu_temp={int(_g(snap,'gpu','temp'))} "
-        f"gpu_power={int(_g(snap,'gpu','power'))} gpu_vram={int(_g(snap,'gpu','vram_pct'))}",
-        f"disk_C={int(_g(snap,'disk','C'))} whea_errors={int(_g(snap,'whea','recent_errors'))}",
+        f"cpu_load={_i(snap,'cpu','load')} cpu_temp={_i(snap,'sensors','cpu_temp')} "
+        f"mem_pct={_i(snap,'mem','pct')}",
+        f"gpu_util={_i(snap,'gpu','util')} gpu_temp={_i(snap,'gpu','temp')} "
+        f"gpu_power={_i(snap,'gpu','power')} gpu_vram={_i(snap,'gpu','vram_pct')}",
+        f"disk_C={_i(snap,'disk','C')} whea_errors={_i(snap,'whea','recent_errors')}",
     ])
 
 
 def summarize(snap: dict) -> str:
     """One-line human summary embedded in every report (training label + runtime)."""
-    return (f"CPU {int(_g(snap,'cpu','load'))}% / {int(_g(snap,'sensors','cpu_temp'))}C, "
-            f"GPU {int(_g(snap,'gpu','util'))}% / {int(_g(snap,'gpu','temp'))}C / "
-            f"{int(_g(snap,'gpu','power'))}W, RAM {int(_g(snap,'mem','pct'))}%, "
-            f"disk C {int(_g(snap,'disk','C'))}%.")
+    return (f"CPU {_i(snap,'cpu','load')}% / {_i(snap,'sensors','cpu_temp')}C, "
+            f"GPU {_i(snap,'gpu','util')}% / {_i(snap,'gpu','temp')}C / "
+            f"{_i(snap,'gpu','power')}W, RAM {_i(snap,'mem','pct')}%, "
+            f"disk C {_i(snap,'disk','C')}%.")
 
 
 def synthetic_snapshot(rng: random.Random) -> dict:
@@ -154,7 +195,14 @@ THRESH = {
     "drive_temp":  (70, 80),   # NVMe throttle band
     "dns_ms":      (500, 2000),  # steady-state (cached) resolve
     "dns_cold_ms": (5000, 15000),  # resolver->upstream path; this LAN has shown 11s legit-slow
+    "gpu_vram":    (92, 98),   # VRAM used %; 98%+ = OOM imminent for ML work
+    "commit_pct":  (85, 95),   # Windows commit charge vs limit — the REAL allocation-pressure metric
 }
+# absolute free-space floors (GB) — a percentage lies across drive sizes (95% of 8TB is fine,
+# 95% of 256GB is not). crit < warn: LOWER is worse. A big drive with plenty of free GB is
+# downgraded from a pct-CRIT to at most WARN (see the disk block).
+DISK_FREE_GB = {"warn": 25, "crit": 10, "downgrade_gb": 100}
+NTP_OFFSET_MS = 2000       # clock drift beyond this (either direction) is a WARN
 
 
 def _get(snap, *path):
@@ -173,8 +221,8 @@ def diagnose(snap: dict) -> list[dict]:
 
     def chk(value, key, label, unit="C"):
         lim = THRESH.get(key)
-        if value is None or lim is None:
-            return
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or lim is None:
+            return                       # non-numeric (None, "N/A", a dict from a sick collector) -> no finding
         warn, crit = lim
         if value >= crit:
             out.append({"level": "CRIT", "what": label, "value": value, "limit": crit, "unit": unit})
@@ -184,10 +232,34 @@ def diagnose(snap: dict) -> list[dict]:
     chk(_get(snap, "sensors", "cpu_temp"), "cpu_temp", "CPU temp")
     chk(_get(snap, "gpu", "temp"), "gpu_temp", "GPU temp")
     chk(_get(snap, "mem", "pct"), "mem_pct", "RAM", "%")
+
+    # disk usage % — but a large drive with lots of absolute free GB is downgraded from CRIT to
+    # WARN (a percentage alone lies across drive sizes). free_gb also drives its own floor rule.
+    free_gb = snap.get("disk_free_gb") if isinstance(snap.get("disk_free_gb"), dict) else {}
     disk = snap.get("disk", {})
     if isinstance(disk, dict):
+        warn, crit = THRESH["disk_pct"]
         for mount, pct in disk.items():
-            chk(pct, "disk_pct", f"disk {mount}", "%")
+            if not isinstance(pct, (int, float)):
+                continue
+            gb = free_gb.get(mount)
+            has_headroom = isinstance(gb, (int, float)) and gb >= DISK_FREE_GB["downgrade_gb"]
+            if pct >= crit and not has_headroom:
+                out.append({"level": "CRIT", "what": f"disk {mount}", "value": pct, "limit": crit, "unit": "%"})
+            elif pct >= warn:
+                out.append({"level": "WARN", "what": f"disk {mount}", "value": pct, "limit": warn, "unit": "%"})
+    # absolute free-space floor per volume (crit < warn: lower GB is worse)
+    for mount, gb in free_gb.items():
+        if not isinstance(gb, (int, float)):
+            continue
+        if gb <= DISK_FREE_GB["crit"]:
+            out.append({"level": "CRIT", "what": f"disk {mount} free space", "value": gb, "limit": DISK_FREE_GB["crit"], "unit": "GB"})
+        elif gb <= DISK_FREE_GB["warn"]:
+            out.append({"level": "WARN", "what": f"disk {mount} free space", "value": gb, "limit": DISK_FREE_GB["warn"], "unit": "GB"})
+
+    # GPU VRAM pressure + commit charge — collected upstream, never previously thresholded
+    chk(_get(snap, "gpu", "vram_pct"), "gpu_vram", "GPU VRAM", "%")
+    chk(_get(snap, "mem", "commit_pct"), "commit_pct", "commit charge", "%")
 
     # WHEA / hardware errors -> straight to CRIT (no threshold; any is bad)
     whea = _get(snap, "whea", "recent_errors")
@@ -198,6 +270,8 @@ def diagnose(snap: dict) -> list[dict]:
     # Unpopulated headers legitimately read 0 RPM forever, so judge only the CPU fan(s) —
     # or a total stall (every reported fan at 0).
     cpu_temp = _get(snap, "sensors", "cpu_temp")
+    if not isinstance(cpu_temp, (int, float)) or isinstance(cpu_temp, bool):
+        cpu_temp = None                             # hostile/absent -> don't compare a dict to 90
     fans = _get(snap, "sensors", "fans")
     fans = fans if isinstance(fans, dict) else {}   # remote JSON may send a non-dict; don't crash
     cpu_fans = {k: v for k, v in fans.items()
@@ -211,7 +285,7 @@ def diagnose(snap: dict) -> list[dict]:
     liquid = _get(snap, "sensors", "liquid_temp")
     chk(liquid, "liquid_temp", "coolant temp")
     pump = _get(snap, "sensors", "pump_rpm")
-    if liquid is not None and liquid >= 45 and pump == 0:
+    if isinstance(liquid, (int, float)) and not isinstance(liquid, bool) and liquid >= 45 and pump == 0:
         out.append({"level": "CRIT", "what": "AIO pump (stalled while coolant warm)",
                     "value": 0, "limit": "", "unit": "RPM"})
 
@@ -310,6 +384,65 @@ def diagnose(snap: dict) -> list[dict]:
     if "net" in snap and _get(snap, "net", "ping_ms") is None:
         out.append({"level": "CRIT", "what": "internet (1.1.1.1)", "value": "no reply", "limit": "", "unit": ""})
 
+    # containers (Docker): a restart-looping / unhealthy / exited container is a real finding —
+    # 'running < total' alone is NOT (a container you stopped on purpose is not a fault).
+    docker = _get(snap, "docker")
+    if isinstance(docker, dict) and "error" not in docker:
+        if docker.get("daemon_ok") is False:
+            out.append({"level": "CRIT", "what": "docker daemon", "value": "unreachable", "limit": "", "unit": ""})
+        restarting = docker.get("restarting")
+        if isinstance(restarting, (int, float)) and not isinstance(restarting, bool) and restarting >= 1:
+            out.append({"level": "WARN", "what": "docker containers restart-looping", "value": int(restarting), "limit": "", "unit": ""})
+        unhealthy = docker.get("unhealthy")
+        if isinstance(unhealthy, (int, float)) and not isinstance(unhealthy, bool) and unhealthy >= 1:
+            out.append({"level": "WARN", "what": "docker containers unhealthy", "value": int(unhealthy), "limit": "", "unit": ""})
+        exited = docker.get("exited")
+        if isinstance(exited, (int, float)) and not isinstance(exited, bool) and exited >= 1:
+            out.append({"level": "WARN", "what": "docker containers exited", "value": int(exited), "limit": "", "unit": ""})
+
+    # k3s: phase='Running' hides CrashLoopBackOff and not-ready containers — judge those explicitly
+    k3s = _get(snap, "k3s")
+    if isinstance(k3s, dict) and "error" not in k3s:
+        cl = k3s.get("crashloop")
+        if isinstance(cl, (int, float)) and not isinstance(cl, bool) and cl >= 1:
+            out.append({"level": "WARN", "what": "k3s pods crash-looping", "value": int(cl), "limit": "", "unit": ""})
+        nr = k3s.get("not_ready")
+        if isinstance(nr, (int, float)) and not isinstance(nr, bool) and nr >= 1:
+            out.append({"level": "WARN", "what": "k3s pods not ready", "value": int(nr), "limit": "", "unit": ""})
+
+    # corrected machine-checks: not (yet) failures, but a rising count is the early-warning of a
+    # dying part — surfaced as WARN, separate from the straight-to-CRIT uncorrected WHEA above.
+    corrected = _get(snap, "whea", "corrected_7d")
+    if isinstance(corrected, (int, float)) and not isinstance(corrected, bool) and corrected >= 1:
+        out.append({"level": "WARN", "what": "corrected machine-checks (7d)", "value": int(corrected), "limit": "", "unit": ""})
+
+    # GPU driver resets (WDDM TDR / Event 4101) — the canonical GPU-instability signal on Windows
+    tdr = _get(snap, "events", "gpu_tdr_7d")
+    if isinstance(tdr, (int, float)) and not isinstance(tdr, bool) and tdr >= 1:
+        out.append({"level": "WARN", "what": "GPU driver resets (TDR, 7d)", "value": int(tdr), "limit": "", "unit": ""})
+
+    # scheduled tasks whose last run failed (history.py itself runs from Task Scheduler)
+    tasks = _get(snap, "events", "task_failures")
+    if isinstance(tasks, list) and tasks:
+        names = ", ".join(str(t) for t in tasks[:5])
+        out.append({"level": "WARN", "what": "scheduled task failures", "value": names, "limit": "", "unit": ""})
+
+    # SMART critical-warning flag on any physical drive -> imminent failure
+    for d in _get(snap, "storage", "drives") or []:
+        if isinstance(d, dict) and d.get("smart_critical_warning") is True:
+            out.append({"level": "CRIT", "what": f"SMART critical warning ({d.get('name')})", "value": "set", "limit": "", "unit": ""})
+
+    # OS posture: a pending reboot leaves patches half-applied; clock drift breaks logs/certs/auth
+    if _get(snap, "os", "pending_reboot") is True:
+        out.append({"level": "WARN", "what": "reboot pending", "value": "yes", "limit": "", "unit": ""})
+    ntp = _get(snap, "os", "ntp_offset_ms")
+    if isinstance(ntp, (int, float)) and not isinstance(ntp, bool) and abs(ntp) >= NTP_OFFSET_MS:
+        out.append({"level": "WARN", "what": "system clock drift", "value": int(ntp), "limit": NTP_OFFSET_MS, "unit": "ms"})
+
+    # security posture: real-time AV off is a genuine exposure worth a finding
+    if _get(snap, "security", "defender_on") is False:
+        out.append({"level": "WARN", "what": "Windows Defender real-time protection off", "value": "disabled", "limit": "", "unit": ""})
+
     # any collector that returned {"error": ...} is itself a (low-sev) finding
     for k, v in snap.items():
         if isinstance(v, dict) and "error" in v:
@@ -358,6 +491,19 @@ def demo():  # the one runnable check: a hot GPU MUST raise CRIT
     for bad in ([1, 2, 3], "pwn", 5):
         diagnose({"ssh": {"targets": {"x": {"reachable": True, "checks": bad}}}})       # no crash
     diagnose({"ssh": {"targets": {"x": {"reachable": True, "checks": {"c": {"value": 9, "crit": "x"}}}}}})
+    # new rules (run 1): containers, VRAM/commit, free-GB floor + big-drive downgrade, OS/security
+    assert any("restart-looping" in f["what"] for f in diagnose({"docker": {"restarting": 2}})), "docker restart rule"
+    assert not any("docker" in f["what"] for f in diagnose({"docker": {"running": 44, "total": 44, "restarting": 0, "unhealthy": 0, "exited": 0}})), "healthy docker must be silent"
+    assert any("crash-looping" in f["what"] for f in diagnose({"k3s": {"crashloop": 1}})), "k3s crashloop rule"
+    assert any(f["level"] == "CRIT" and "VRAM" in f["what"] for f in diagnose({"gpu": {"vram_pct": 99}})), "vram rule"
+    assert not any("VRAM" in f["what"] for f in diagnose({"gpu": {"vram_pct": "N/A"}})), "non-numeric vram must not crash/fire"
+    dfree = diagnose({"disk": {"E": 96}, "disk_free_gb": {"E": 350}})
+    assert any(f["level"] == "WARN" and f["what"] == "disk E" for f in dfree) and not any(f["level"] == "CRIT" and f["what"] == "disk E" for f in dfree), "big-drive downgrade"
+    assert any(f["level"] == "CRIT" and "free space" in f["what"] for f in diagnose({"disk_free_gb": {"C": 8}})), "free-GB floor"
+    assert any("clock drift" in f["what"] for f in diagnose({"os": {"ntp_offset_ms": 5000}})), "clock drift rule"
+    assert not any("reboot" in f["what"] for f in diagnose({"os": {"pending_reboot": None}})), "None reboot must not fire"
+    for bad in ("pwn", [1, 2, 3], 5):
+        diagnose({"docker": bad}); diagnose({"k3s": bad})     # hostile types must not crash
     print("rules ok")
 
 
@@ -634,7 +780,9 @@ from gpt import GPT, GPTConfig, CharTokenizer
 
 # ----------------------------------------------------------------- config (tweak me)
 batch_size   = 64
-block_size   = 256
+block_size   = 512     # >= the longest training doc (max 434 chars) so a multi-finding report is
+#                        generated with its INPUT metrics still in the attention window (was 256,
+#                        which truncated ~10% of alert docs mid-report). See RSI run 7.
 max_iters    = 3000
 eval_interval = 250
 eval_iters   = 50
@@ -827,9 +975,11 @@ stays populated.
 > smartmontools usbutils` then `sudo sensors-detect`. GPU/Docker/k3s/SSH collectors need their
 > respective tools (`nvidia-smi`, `docker`, `k3s`, `ssh`).
 >
-> **Omitted on Linux:** `tpm.py` and `me.py` are Windows-only (Get-Tpm / the Intel ME driver).
-> Skip them; the shared `rules.py` simply sees no `tpm`/`me` keys. If you want TPM state on
-> Linux, add a collector that reads `/sys/class/tpm/`.
+> **Omitted on Linux:** `tpm.py`, `me.py`, `os.py`, `security.py`, `events.py`, and `wsl.py` are
+> Windows-specific (Get-Tpm / Intel ME / registry+event-log / Defender+BitLocker / the WSL VM).
+> Skip them; the shared `rules.py` simply sees no such keys. Linux analogues if you want them:
+> TPM via `/sys/class/tpm/`, uptime via `/proc/uptime`, security via `ufw`/`aa-status`, events via
+> `journalctl`. `procs.py` below is the Linux port (psutil); the rest of the fleet is native.
 
 ### `collectors/cpu.py` (Linux)
 
@@ -1078,6 +1228,46 @@ except Exception as e:
     print(json.dumps({"vm": {"error": str(e)}}))
 ```
 
+### `collectors/procs.py` (Linux)
+
+```python
+# collectors/procs.py (Linux) — top CPU / RAM consumers via psutil, plus per-process
+# GPU VRAM via nvidia-smi where present. Same keys the Windows procs.py emits.
+import json, shutil, subprocess
+try:
+    import psutil
+    for p in psutil.process_iter(["name"]):      # prime cpu_percent (first call returns 0.0)
+        try: p.cpu_percent()
+        except Exception: pass
+    import time; time.sleep(0.3)
+    rows = []
+    for p in psutil.process_iter(["name", "memory_info"]):
+        try:
+            rows.append((p.info["name"], p.cpu_percent(), p.info["memory_info"].rss))
+        except Exception:
+            continue
+    n = psutil.cpu_count() or 1
+    top_cpu = [{"name": nm, "cpu_pct": round(c / n, 1)} for nm, c, _ in
+               sorted(rows, key=lambda r: -r[1])[:5]]
+    top_mem = [{"name": nm, "mem_mb": int(m / 1048576)} for nm, _, m in
+               sorted(rows, key=lambda r: -r[2])[:5]]
+    out = {"top_cpu": top_cpu, "top_mem": top_mem}
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        r = subprocess.run([smi, "--query-compute-apps=process_name,used_memory",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=6)
+        gv = []
+        for ln in r.stdout.strip().splitlines():
+            if "," in ln:
+                nm, mb = ln.rsplit(",", 1)
+                try: gv.append({"name": nm.strip(), "vram_mb": int(float(mb))})
+                except ValueError: pass
+        out["top_gpu_vram"] = sorted(gv, key=lambda x: -x["vram_mb"])[:5]
+    print(json.dumps({"procs": out}))
+except Exception as e:
+    print(json.dumps({"procs": {"error": str(e)}}))
+```
+
 ### Cross-platform collectors (identical to the Windows repo files)
 
 These need no Linux changes — `gpu` (nvidia-smi), `docker`, `services` (native `systemctl`), `ssh`, `lights` (OpenRGB SDK), and the SDR skeletons. Embedded here for completeness.
@@ -1132,10 +1322,16 @@ try:
         except Exception:
             continue
     vram = round(100 * num(used) / num(total)) if num(used) is not None and num(total) else None
+    driver = None
+    try:
+        driver = q("driver_version")[0] or None
+    except Exception:
+        pass
     print(json.dumps({"gpu": {
         "util": i(u), "temp": i(t), "power": i(p), "vram_pct": vram,
+        "vram_used_mb": i(used), "vram_total_mb": i(total),
         "fan_pct": i(fan), "pstate": pstate, "sm_mhz": i(sm), "sm_max_mhz": i(smmax),
-        "power_limit": i(plim), "throttle": reasons,
+        "power_limit": i(plim), "throttle": reasons, "driver": driver,
         "pcie": {"gen": i(gen), "gen_max": i(genmax), "width": i(w), "width_max": i(wmax)},
     }}))
 except FileNotFoundError:
@@ -1196,8 +1392,12 @@ def _int(s):
 
 
 def _run(args):
-    out = subprocess.run([DOCKER, *args], capture_output=True, text=True, timeout=30).stdout.strip()
-    return [json.loads(line) for line in out.splitlines() if line.strip()]
+    # raise on a nonzero exit so a DOWN daemon (empty stdout, error on stderr) is distinguishable
+    # from a genuinely empty result — otherwise "daemon unreachable" reads as "zero containers".
+    r = subprocess.run([DOCKER, *args], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "docker command failed").strip()[:200])
+    return [json.loads(line) for line in r.stdout.strip().splitlines() if line.strip()]
 
 
 def main():
@@ -1205,7 +1405,12 @@ def main():
         print(json.dumps({"docker": {"error": "docker.exe not found (is Docker Desktop installed?)"}}))
         return
     try:
-        ps = _run(["ps", "--all", "--format", "{{json .}}"])
+        try:
+            ps = _run(["ps", "--all", "--format", "{{json .}}"])
+        except Exception as e:
+            # daemon down / unreachable — an explicit state, NOT zero containers
+            print(json.dumps({"docker": {"daemon_ok": False, "error": str(e)[:200]}}))
+            return
         try:
             stats = {s.get("Name"): s for s in _run(["stats", "--no-stream", "--format", "{{json .}}"])}
         except Exception:
@@ -1231,8 +1436,19 @@ def main():
                 "blk_write_bytes": blk_w,
                 "pids": _int(st.get("PIDs")),
             })
-        running = sum(1 for r in ps if str(r.get("Status", "")).startswith("Up"))
-        print(json.dumps({"docker": {"running": running, "total": len(containers),
+        def _status(r):
+            return str(r.get("Status", ""))
+        running = sum(1 for r in ps if _status(r).startswith("Up"))
+        # parse the status string for the states rules.py acts on. Docker writes these verbatim:
+        #   "Up 2 hours (unhealthy)", "Restarting (1) 5 seconds ago", "Exited (0) 3 days ago",
+        #   "Up 2 hours (Paused)".
+        restarting = sum(1 for r in ps if _status(r).startswith("Restarting"))
+        unhealthy = sum(1 for r in ps if "(unhealthy)" in _status(r))
+        exited = sum(1 for r in ps if _status(r).startswith("Exited"))
+        paused = sum(1 for r in ps if "(Paused)" in _status(r))
+        print(json.dumps({"docker": {"daemon_ok": True, "running": running, "total": len(containers),
+                                     "restarting": restarting, "unhealthy": unhealthy,
+                                     "exited": exited, "paused": paused,
                                      "containers": containers}}))
     except Exception as e:
         print(json.dumps({"docker": {"error": str(e)}}))
@@ -1860,16 +2076,28 @@ def snapshot(only=None) -> dict:
     return snap
 
 
+def exit_code_for(findings) -> int:
+    """Machine-consumable severity: 0 = clean, 1 = WARN only, 2 = CRIT present. Lets Task
+    Scheduler / CI / scripts detect machine distress without parsing stdout."""
+    levels = {f.get("level") for f in findings if isinstance(f, dict)}
+    if "CRIT" in levels:
+        return 2
+    if "WARN" in levels:
+        return 1
+    return 0
+
+
 def print_findings(snap):
     import rules
     findings = rules.diagnose(snap)
     if not findings:
         print("OK - no findings. (collectors seen: " + ", ".join(sorted(snap)) + ")")
-        return
+        return findings
     order = {"CRIT": 0, "WARN": 1}
     for f in sorted(findings, key=lambda x: order.get(x["level"], 9)):
         print(f"[{f['level']:4}] {f['what']}: {f['value']}{f['unit']}"
               + (f" (limit {f['limit']}{f['unit']})" if isinstance(f["limit"], (int, float)) else ""))
+    return findings
 
 
 def narrate():
@@ -1899,31 +2127,63 @@ def main():
     snap = snapshot(only="net" if args.cmd == "net" else None)
     if args.json:
         print(json.dumps(snap, indent=2))
+        return 0
+    import rules
+    findings = rules.diagnose(snap)
+    # reuse print_findings for the human output, then exit with a severity-coded status
+    if not findings:
+        print("OK - no findings. (collectors seen: " + ", ".join(sorted(snap)) + ")")
     else:
-        print_findings(snap)
+        order = {"CRIT": 0, "WARN": 1}
+        for f in sorted(findings, key=lambda x: order.get(x["level"], 9)):
+            print(f"[{f['level']:4}] {f['what']}: {f['value']}{f['unit']}"
+                  + (f" (limit {f['limit']}{f['unit']})" if isinstance(f["limit"], (int, float)) else ""))
+    return exit_code_for(findings)
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    _sys.exit(main() or 0)
 ```
 
 ### `history.py`
 
 ```python
 # history.py — append one snapshot to a SQLite history DB. Run on a timer (Task Scheduler).
-# Same data as `sysdiag --json`, stored as one row: timestamp + the full snapshot JSON.
-import sqlite3, json, time, pathlib
+# One row = timestamp + host + the full snapshot JSON. The host column lets the History graph and
+# the Search feature tell machines apart; an index on (host, ts) keeps queries fast as it grows.
+# DB path is overridable via WATCHTOWER_HISTORY_DB (used by the exam to stay hermetic).
+import sqlite3, json, time, os, pathlib, socket
 import sysdiag
 
-DB = pathlib.Path(__file__).parent / "history.db"   # absolute, so CWD doesn't matter
+DB = pathlib.Path(os.environ.get("WATCHTOWER_HISTORY_DB")
+                  or (pathlib.Path(__file__).parent / "history.db"))
+RETAIN_DAYS = int(os.environ.get("WATCHTOWER_HISTORY_RETAIN_DAYS", "0"))   # 0 = keep everything
+
+
+def _ensure(con):
+    con.execute("CREATE TABLE IF NOT EXISTS snapshots (ts TEXT, host TEXT, json TEXT)")
+    # migrate a pre-host table (older rows have no host column) BEFORE indexing on host
+    cols = [r[1] for r in con.execute("PRAGMA table_info(snapshots)").fetchall()]
+    if "host" not in cols:
+        con.execute("ALTER TABLE snapshots ADD COLUMN host TEXT")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_snap_host_ts ON snapshots(host, ts)")
+
 
 def main():
     snap = sysdiag.snapshot()                        # runs the collectors (local sensors)
+    host = snap.get("_host") or socket.gethostname()
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
     with sqlite3.connect(DB) as con:
-        con.execute("CREATE TABLE IF NOT EXISTS snapshots (ts TEXT, json TEXT)")
-        con.execute("INSERT INTO snapshots VALUES (?, ?)",
-                    (time.strftime("%Y-%m-%dT%H:%M:%S"), json.dumps(snap)))
-    print("logged", time.strftime("%H:%M:%S"))
+        _ensure(con)
+        con.execute("INSERT INTO snapshots(ts, host, json) VALUES (?, ?, ?)",
+                    (ts, host, json.dumps(snap)))
+        if RETAIN_DAYS > 0:
+            cutoff = time.strftime("%Y-%m-%dT%H:%M:%S",
+                                   time.localtime(time.time() - RETAIN_DAYS * 86400))
+            con.execute("DELETE FROM snapshots WHERE ts < ?", (cutoff,))
+    print("logged", ts, host)
+
 
 if __name__ == "__main__":
     main()
@@ -2002,6 +2262,8 @@ def _record(fresh, merge, host, extra=None):
     """Fold one snapshot into `host`'s ring. `merge` True = fast partial (keep prior full-tier
     keys), False = full replace. `extra` (label/tags from a remote payload) is stamped in."""
     errs = fresh.pop("_errors", [])
+    if not isinstance(errs, list):        # semi-trusted remote JSON: a non-list _errors must not
+        errs = [str(errs)]                # crash _record (it's summed with the other tier's list)
     now = time.time()
     with _lock:
         st = _hosts.get(host) or _hosts.setdefault(host, _new_host())
@@ -2212,10 +2474,11 @@ if __name__ == "__main__":
 ```python
 # trends.py — read history.db and return time-series DataFrames for the UI graphs.
 # history.db is filled by the Task Scheduler logger (history.py); this only reads it.
-import json, sqlite3, pathlib, datetime
+import json, sqlite3, os, pathlib
 import pandas as pd
 
-DB = pathlib.Path(__file__).parent / "history.db"
+DB = pathlib.Path(os.environ.get("WATCHTOWER_HISTORY_DB")
+                  or (pathlib.Path(__file__).parent / "history.db"))
 
 # Friendly label -> path into a snapshot dict.
 METRICS = {
@@ -2246,15 +2509,23 @@ def _dig(snap, path):
     return cur
 
 
-def series(metric, runs_label="Last 25 runs"):
+def series(metric, runs_label="Last 25 runs", host=None):
     path = METRICS.get(metric)
     if path is None or not DB.exists():
         return pd.DataFrame({"time": [], "value": [], "when": []})
     limit = RUNS.get(runs_label)
-    query = "SELECT ts, json FROM snapshots ORDER BY ts DESC"
+    where, params = "", []
+    if host:
+        where = " WHERE host = ?"
+        params.append(host)
+    query = f"SELECT ts, json FROM snapshots{where} ORDER BY ts DESC"
     if limit:
         query += f" LIMIT {int(limit)}"   # int() guards the f-string against injection
-    rows = sqlite3.connect(DB).execute(query).fetchall()
+    with sqlite3.connect(DB) as con:      # close the handle (the Gradio app renders many graphs)
+        try:
+            rows = con.execute(query, params).fetchall()
+        except sqlite3.OperationalError:
+            rows = con.execute(query.replace(where, ""), []).fetchall()  # pre-host DB: no host col
     rows.reverse()  # DESC fetch gives newest-first; flip to oldest->newest for the line
     times, values = [], []
     for ts, j in rows:
@@ -2274,6 +2545,180 @@ if __name__ == "__main__":
     df = series("CPU temp (C)", "Last 10 runs")
     assert list(df.columns) == ["time", "value", "when"] and len(df) <= 10
     print(df.tail())
+```
+
+### `search.py`
+
+```python
+# search.py — search the logged history by COMPONENT, by COMPUTER (host), and by DATE/TIME.
+# Reads the same history.db that history.py writes (path overridable via WATCHTOWER_HISTORY_DB).
+# A "component" is matched as a case-insensitive substring against each metric's dotted path
+# (e.g. "cpu_temp" -> sensors.cpu_temp, "gpu" -> every gpu.* metric, "temp" -> all temperatures),
+# so you can search broad or narrow. Returns flat rows {ts, host, metric, value} — READ ONLY.
+import sqlite3, json, os, pathlib
+
+DB = pathlib.Path(os.environ.get("WATCHTOWER_HISTORY_DB")
+                  or (pathlib.Path(__file__).parent / "history.db"))
+
+
+def _flatten(snap, prefix=""):
+    """Yield (dotted_path, scalar_value) for every scalar leaf; skip private _keys and containers
+    (the value we plot/search is always a scalar)."""
+    for k, v in snap.items():
+        if str(k).startswith("_"):
+            continue
+        path = f"{prefix}{k}"
+        if isinstance(v, dict):
+            yield from _flatten(v, path + ".")
+        elif isinstance(v, (int, float, str, bool)) or v is None:
+            yield path, v
+        # lists (containers/drives) are skipped — search targets scalar metrics
+
+
+def search(component=None, host=None, since=None, until=None, limit=2000):
+    """Rows matching all supplied filters, newest first.
+      component  case-insensitive substring of the metric's dotted path (None = all metrics)
+      host       exact machine name (None = all)
+      since/until  ISO 'YYYY-MM-DDThh:mm:ss' bounds on the snapshot timestamp (inclusive)
+    """
+    if not DB.exists():
+        return []
+    where, params = [], []
+    if host is not None:
+        where.append("host = ?"); params.append(host)
+    if since is not None:
+        where.append("ts >= ?"); params.append(since)
+    if until is not None:
+        where.append("ts <= ?"); params.append(until)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    comp = component.lower() if component else None
+    out = []
+    with sqlite3.connect(DB) as con:
+        try:
+            rows = con.execute(f"SELECT ts, host, json FROM snapshots{clause} ORDER BY ts DESC",
+                               params).fetchall()
+        except sqlite3.OperationalError:
+            # pre-host DB (no host column): re-query without host filtering, tag rows as unknown
+            rows = con.execute("SELECT ts, json FROM snapshots ORDER BY ts DESC").fetchall()
+            rows = [(ts, None, j) for ts, j in rows]
+    for row in rows:
+        ts, h, j = row
+        try:
+            snap = json.loads(j)
+        except Exception:
+            continue
+        h = h or snap.get("_host") or "?"
+        if host is not None and h != host:
+            continue
+        for path, value in _flatten(snap):
+            if comp is None or comp in path.lower():
+                out.append({"ts": ts, "host": h, "metric": path, "value": value})
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def components(host=None, limit=500):
+    """The distinct metric paths present in history — for a search-UI dropdown."""
+    seen = {}
+    for r in search(host=host, limit=limit * 40):
+        seen[r["metric"]] = None
+    return sorted(seen)
+
+
+def demo():  # the one runnable check (uses a temp DB seeded with two hosts)
+    import tempfile, time
+    p = pathlib.Path(tempfile.mkdtemp()) / "h.db"
+    os.environ["WATCHTOWER_HISTORY_DB"] = str(p)
+    global DB
+    DB = p
+    with sqlite3.connect(p) as con:
+        con.execute("CREATE TABLE snapshots (ts TEXT, host TEXT, json TEXT)")
+        con.execute("INSERT INTO snapshots VALUES (?,?,?)",
+                    ("2026-07-02T10:00:00", "PC-A", json.dumps({"sensors": {"cpu_temp": 55}, "gpu": {"temp": 60}})))
+        con.execute("INSERT INTO snapshots VALUES (?,?,?)",
+                    ("2026-07-02T11:00:00", "PC-B", json.dumps({"sensors": {"cpu_temp": 70}})))
+    assert len(search(component="cpu_temp")) == 2, "component search"
+    assert len(search(component="cpu_temp", host="PC-A")) == 1, "host filter"
+    assert len(search(component="cpu_temp", host="nope")) == 0, "host miss"
+    assert len(search(component="temp")) == 3, "substring matches cpu_temp + gpu.temp"
+    assert len(search(component="cpu_temp", until="2026-07-02T10:30:00")) == 1, "time window"
+    assert all({"ts", "host", "metric", "value"} <= set(r) for r in search(component="cpu")), "row shape"
+    print("search ok")
+
+
+if __name__ == "__main__":
+    demo()
+```
+
+### `notes.py`
+
+```python
+# notes.py — shared operator notes for the Watch Tower dashboard. Multiple people using the same
+# instance can leave a note ("rebooted the NAS", "GPU RMA pending") that everyone else sees. Plain
+# SQLite so it persists across restarts and across processes; no new pip deps. READ + APPEND only,
+# never executed. DB path overridable via WATCHTOWER_NOTES_DB (the exam uses this to stay hermetic).
+import sqlite3, os, time, pathlib
+
+DB = pathlib.Path(os.environ.get("WATCHTOWER_NOTES_DB")
+                  or (pathlib.Path(__file__).parent / "notes.db"))
+MAX_TEXT = 10_000          # a note is a sentence or three, not a document
+MAX_USER = 64
+
+
+def _con():
+    con = sqlite3.connect(DB)
+    con.execute("CREATE TABLE IF NOT EXISTS notes (ts TEXT, user TEXT, text TEXT, host TEXT)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_notes_ts ON notes(ts)")
+    return con
+
+
+def add_note(user: str, text: str, host: str = "") -> dict:
+    """Append one note. Raises ValueError on empty text or over-length input (a trust boundary:
+    the note comes from a browser form)."""
+    user = (str(user).strip() or "anonymous")[:MAX_USER]
+    text = str(text).strip()
+    if not text:
+        raise ValueError("note text is empty")
+    if len(text) > MAX_TEXT:
+        raise ValueError(f"note too long ({len(text)} > {MAX_TEXT} chars)")
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    with _con() as con:
+        con.execute("INSERT INTO notes(ts, user, text, host) VALUES (?, ?, ?, ?)",
+                    (ts, user, text, str(host)[:MAX_USER]))
+    return {"ts": ts, "user": user, "text": text, "host": str(host)[:MAX_USER]}
+
+
+def list_notes(limit: int = 200) -> list[dict]:
+    """Most recent notes first."""
+    if not DB.exists():
+        return []
+    with _con() as con:
+        rows = con.execute("SELECT ts, user, text, host FROM notes ORDER BY ts DESC LIMIT ?",
+                           (int(limit),)).fetchall()
+    return [{"ts": ts, "user": u, "text": t, "host": h} for ts, u, t, h in rows]
+
+
+def demo():  # the one runnable check
+    import tempfile
+    os.environ["WATCHTOWER_NOTES_DB"] = str(pathlib.Path(tempfile.mkdtemp()) / "t.db")
+    global DB
+    DB = pathlib.Path(os.environ["WATCHTOWER_NOTES_DB"])
+    n = add_note("alice", "rebooted the NAS")
+    assert n["user"] == "alice" and any(x["text"] == "rebooted the NAS" for x in list_notes())
+    try:
+        add_note("bob", "x" * (MAX_TEXT + 1)); assert False, "over-length must raise"
+    except ValueError:
+        pass
+    try:
+        add_note("bob", "   "); assert False, "empty must raise"
+    except ValueError:
+        pass
+    print("notes ok")
+
+
+if __name__ == "__main__":
+    demo()
 ```
 
 ### `context.py`
@@ -2401,27 +2846,36 @@ from sqlite_vec import serialize_float32
 OLLAMA_HOST  = "http://127.0.0.1:11434"
 OLLAMA_EMBED = OLLAMA_HOST + "/api/embed"        # batch endpoint (newer Ollama): {"input": [...]}
 OLLAMA_EMB1  = OLLAMA_HOST + "/api/embeddings"   # single endpoint (older Ollama): {"prompt": "..."}
-EMBED_MODEL  = "nomic-embed-text"                # `ollama pull nomic-embed-text` (~270 MB, CPU-ok)
+# mxbai-embed-large (1024-dim) measured best on this repo's frozen QA set: hit@5 0.939 / MRR@5
+# 0.792, a strict win over nomic-embed-text (0.909 / 0.774) on BOTH recall and ranking. Swap back
+# to "nomic-embed-text" (768-dim, ~270 MB, faster) if VRAM/pull size matters — retrieval degrades
+# only slightly. A model change rebuilds the index automatically (settings hash below).
+EMBED_MODEL  = "mxbai-embed-large"               # `ollama pull mxbai-embed-large` (~670 MB, CPU-ok)
 EMBED_BATCH  = 64                                # chunks sent per /api/embed request
 HERE = pathlib.Path(__file__).parent
 DB   = HERE / "rag_index.db"                     # generated cache — git-ignored
 
 # Docs to make searchable: EVERY *.md in this folder, plus the homelab notes (if present). Missing
 # files are skipped. Drop a new .md in here and the next `python rag.py --build` picks it up.
-SOURCES = [pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md", *sorted(HERE.glob("*.md"))]
+# Project meta-docs (this RSI log, the recreate/instruction guides) are NOT reference material —
+# excluded so they don't dilute a hardware/troubleshooting query.
+_EXCLUDE = {"RSI-REPORT.md"}
+SOURCES = [pathlib.Path.home() / "homelab" / "HOMELAB-COMPLETE-SETUP.md",
+           *[p for p in sorted(HERE.glob("*.md")) if p.name not in _EXCLUDE]]
 
 # --- tuning knobs (the RAG equivalent of rules.THRESH — tune for YOUR docs) ---
-CHUNK_CHARS = 1200    # size of each searchable slice (~300 tokens)
-OVERLAP     = 200     # chars repeated between neighbours so a fact on a boundary isn't lost
+# 1600/400 measured best with mxbai on this corpus (see the model note above). Larger chunks then
+# hurt (facts get averaged out); smaller ones split answers across chunk boundaries.
+CHUNK_CHARS = 1600    # size of each searchable slice (~400 tokens)
+OVERLAP     = 400     # chars repeated between neighbours so a fact on a boundary isn't lost
 TOP_K       = 4       # how many chunks to return per question
 MIN_SCORE   = 0.45    # cosine floor; below this a chunk is "not really relevant" and is dropped
                       #   -> an off-topic question retrieves nothing. THIS is the knob to tune.
 
-# nomic-embed-text wants these task prefixes; they materially improve retrieval. Other embedders
-# differ: mxbai-embed-large wants only a query-side instruction and no document prefix. If unsure
-# for your model, set both to "" — it works, just slightly weaker on the query side.
-DOC_PREFIX   = "search_document: "
-QUERY_PREFIX = "search_query: "
+# mxbai-embed-large wants a query-side instruction and NO document prefix. (nomic-embed-text
+# instead wants "search_document: " / "search_query: " — swap both if you switch back.)
+DOC_PREFIX   = ""
+QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
 
 def _log(msg: str) -> None:
@@ -2603,13 +3057,34 @@ def build_index(force: bool = False) -> sqlite3.Connection:
     return con
 
 
+# --- hybrid rerank: fetch a larger vector pool, then re-rank by cosine + how much the chunk's
+# vocabulary overlaps the QUESTION (a BM25-style lexical signal). Measured on this repo's frozen
+# 33-QA set: MRR@5 0.79 -> 0.95, hit@5 0.94 -> 0.97 — the answer passage both embeds near AND
+# shares words with the question, and lexical overlap breaks ties the embedding alone gets wrong.
+RERANK_POOL  = 20     # vector candidates to rerank (>= k)
+RERANK_ALPHA = 0.6    # weight on cosine; (1-alpha) on lexical overlap. 0.5-0.7 all optimal here.
+_WORD = re.compile(r"[a-z0-9]{3,}")
+_STOP = frozenset(("the and for with your you are that this how what when where can does from into "
+                   "will would should could have has had not but they them then than").split())
+
+
+def _lex_overlap(query: str, text: str) -> float:
+    qw = set(_WORD.findall(query.lower())) - _STOP
+    if not qw:
+        return 0.0
+    return len(qw & set(_WORD.findall(text.lower()))) / len(qw)
+
+
 def _knn(con, question: str, k: int):
-    """The k nearest chunks as [(cosine_score, source, text), ...]; empty if the corpus is empty."""
+    """The k best chunks as [(cosine_score, source, text), ...], hybrid-reranked (vector + lexical).
+    The returned score is still the cosine (so retrieve()'s min_score floor is unchanged); only the
+    ORDER reflects the hybrid rank. Empty if the corpus is empty."""
     q = serialize_float32(_embed(question, QUERY_PREFIX))
+    pool = max(k, RERANK_POOL)
     try:
         rows = con.execute(
             "SELECT rowid, distance FROM vec_chunks WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
-            (q, k),
+            (q, pool),
         ).fetchall()
     except sqlite3.OperationalError:
         return []                    # no vec_chunks table -> nothing indexed
@@ -2618,7 +3093,8 @@ def _knn(con, question: str, k: int):
         score = 1.0 - (dist * dist) / 2.0    # L2 on UNIT vectors -> cosine (vectors are normalized)
         src, txt = con.execute("SELECT source, text FROM chunks WHERE id = ?", (rowid,)).fetchone()
         out.append((score, src, txt))
-    return out
+    out.sort(key=lambda r: -(RERANK_ALPHA * r[0] + (1.0 - RERANK_ALPHA) * _lex_overlap(question, r[2])))
+    return out[:k]
 
 
 def retrieve(question: str, k: int = TOP_K, min_score: float = MIN_SCORE) -> list[str]:
@@ -2729,9 +3205,10 @@ if __name__ == "__main__":
 ### `app.py`
 
 ```python
-"""app.py — Watch Tower: live stats, chat, and history graphs. READ-ONLY, 127.0.0.1 only."""
+"""app.py — Watch Tower: live stats, chat, history graphs, search, and shared notes.
+READ-ONLY, 127.0.0.1 only."""
 import gradio as gr
-import schema, brain, context, art, trends, live
+import schema, brain, context, art, trends, live, search, notes
 
 if gr.NO_RELOAD:   # guard: `gradio app.py` reload mode re-imports modules — without this,
     #              every source edit would leak one more immortal sampler thread.
@@ -2785,8 +3262,37 @@ def stats_md(host) -> str:
     return "\n".join(lines)
 
 
-def plot(metric, rng):
-    return trends.series(metric, rng)
+def plot(metric, rng, host):
+    # History is per-host too (history.py stamps the host); None/"" host = all machines
+    return trends.series(metric, rng, host=host if host and host != WAITING else None)
+
+
+# ---- Search: by component, by computer, by date/time ----
+def do_search(component, host, since, until):
+    h = host if host and host not in ("(any)", WAITING) else None
+    rows = search.search(component=(component or None), host=h,
+                         since=(since or None), until=(until or None), limit=500)
+    if not rows:
+        return [["(no matches)", "", "", ""]]
+    return [[r["ts"], r["host"], r["metric"], r["value"]] for r in rows[:500]]
+
+
+# ---- Shared notes: any user of this instance can leave one, everyone sees them ----
+def render_notes():
+    ns = notes.list_notes()
+    if not ns:
+        return "*No notes yet — be the first to leave one.*"
+    return "\n".join(f"- **{n['user']}** · *{n['ts']}*"
+                     + (f" · `{n['host']}`" if n.get("host") else "") + f"  \n  {n['text']}"
+                     for n in ns)
+
+
+def post_note(user, text):
+    try:
+        notes.add_note(user, text, host=live.get_focus() or "")
+    except ValueError as e:
+        return render_notes() + f"\n\n> ⚠️ {e}", user, text
+    return render_notes(), user, ""      # clear the note box, keep the name
 
 
 _init_hosts = live.hosts()
@@ -2844,17 +3350,45 @@ with gr.Blocks(title="Watch Tower") as app:
     with gr.Row():
         metric = gr.Dropdown(list(trends.METRICS), value="CPU temp (C)", label="Component / metric")
         runs = gr.Dropdown(list(trends.RUNS), value="Last 25 runs", label="Show")
-    graph = gr.LinePlot(trends.series("CPU temp (C)", "Last 25 runs"),
+    graph = gr.LinePlot(trends.series("CPU temp (C)", "Last 25 runs", host=_init_host if _init_host != WAITING else None),
                         x="time", y="value", tooltip=["when", "value"],
                         title="History", height=320)
-    metric.change(plot, [metric, runs], graph)
-    runs.change(plot, [metric, runs], graph)
+    metric.change(plot, [metric, runs, host_sel], graph)
+    runs.change(plot, [metric, runs, host_sel], graph)
+    host_sel.change(plot, [metric, runs, host_sel], graph)
+
+    with gr.Accordion("🔎 Search history — by component, computer, or date/time", open=False):
+        gr.Markdown("Search every logged snapshot. **Component** is a substring of the metric "
+                    "path (`cpu_temp`, `gpu`, `disk`, `docker`…). Leave a field blank for *any*.")
+        with gr.Row():
+            s_comp = gr.Textbox(label="Component / metric", value="cpu_temp", scale=2)
+            s_host = gr.Textbox(label="Computer (host)", placeholder="(any)", scale=1)
+            s_since = gr.Textbox(label="Since", placeholder="2026-07-01T00:00:00", scale=1)
+            s_until = gr.Textbox(label="Until", placeholder="2026-07-02T23:59:59", scale=1)
+        s_btn = gr.Button("Search", variant="primary")
+        s_results = gr.Dataframe(headers=["when", "computer", "metric", "value"],
+                                 label="Results (newest first, up to 500)", wrap=True)
+        s_btn.click(do_search, [s_comp, s_host, s_since, s_until], s_results)
+
+    with gr.Accordion("📝 Shared notes — leave a note for other users of this dashboard", open=False):
+        notes_md = gr.Markdown(render_notes())
+        with gr.Row():
+            n_user = gr.Textbox(label="Your name", placeholder="e.g. dylan", scale=1)
+            n_text = gr.Textbox(label="Note", placeholder="e.g. RMA'd the NZXT pump — AIO temps are stale",
+                                scale=3, lines=1)
+        n_btn = gr.Button("Post note", variant="primary")
+        n_btn.click(post_note, [n_user, n_text], [notes_md, n_user, n_text])
+        gr.Timer(15).tick(render_notes, outputs=notes_md)   # pick up other users' notes live
 
 
 if __name__ == "__main__":
+    import os
     art.cli_banner()
+    # port is env-overridable so a second instance (or a remote-monitoring GUI) can run alongside
+    # a local one without editing source; default stays 7860.
+    port = int(os.environ.get("WATCHTOWER_PORT") or os.environ.get("GRADIO_SERVER_PORT") or 7860)
     try:
-        app.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True)
+        app.launch(server_name="127.0.0.1", server_port=port, inbrowser=True)
     finally:
         import subprocess  # free the model's VRAM on clean exit (Ctrl+C / window close)
         subprocess.run(["ollama", "stop", brain.MODEL], check=False)
@@ -3263,7 +3797,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install torch --index-url https://download.pytorch.org/whl/cu128
-pip install gradio pandas psutil
+pip install gradio pandas psutil sqlite-vec
 ```
 Confirm torch sees your GPU:
 ```bash
@@ -3283,10 +3817,14 @@ Expected: `schema ok`, `rules ok`, `live ok — ...`, `docker parsers ok`.
 
 ### 6.3 Generate the corpus, train, test the GPT
 ```bash
-python data.py 8000        # -> wrote corpus.txt: 8000 docs, ...
-python train.py            # -> trains ~2-5 min on a CUDA GPU; writes ckpt.pt + vocab.json
+python data.py 8000        # -> wrote corpus.txt: 8000 docs (deterministic, seed 1337)
+python train.py            # -> ~3 min on a CUDA GPU (bf16) / ~20-30 min CPU; val loss ~0.19;
+#                             writes ckpt.pt (~47 MB) + vocab.json
 python infer.py --demo     # -> MODEL OUTPUT should read like the GROUND TRUTH
 ```
+> `corpus.txt`, `vocab.json`, and `ckpt.pt` are **generated artifacts** — regenerable and
+> git-ignored. `data.py` is deterministic, so the corpus reproduces byte-for-byte. Retrain
+> whenever you change `schema.serialize_metrics` / `data.render_report` / the corpus size.
 
 ### 6.4 Run the live collectors
 ```bash
@@ -3311,26 +3849,51 @@ python sysdiag.py discover --spawn   # stub a collector for a recognized, uncove
 
 ---
 
-## 7. Connect Ollama (the 32B chat model)
+## 7. Connect Ollama (the chat brain)
 
 1. Install Ollama — it serves on `127.0.0.1:11434`.
-2. Pull the model (~19 GB): `ollama pull qwen2.5:32b`
+2. Pull the default model (~19 GB): `ollama pull qwen2.5:32b`
 3. Verify: `ollama run qwen2.5:32b "say OK"` → `OK`.
 4. Check it's resident: `ollama ps`.
 
-> **Model / VRAM notes** (set in `brain.py`): `MODEL` = any pulled model (`ollama list`);
-> `num_ctx=32768` costs ~256 KB/token of KV cache for a 32B (~8 GB at 32k) — with the ~19 GB
-> weights that's ~28 GB, fits a 32 GB GPU; drop to `16384`/`8192` on a smaller GPU.
-> `keep_alive="30m"` keeps it warm; `app.py`/`chat.py` run `ollama stop` on clean exit.
-
 Smoke-test the brain (Ollama up): `python brain.py` → `brain ok: <a sentence about your machine>`.
 
-### US-built open-weight alternatives
-`brain.py` defaults to `qwen2.5:32b` (Alibaba). To run a US-built model, `ollama pull` one and set
-`MODEL` to that tag — same code path. Strong picks: **`gpt-oss:20b`** (OpenAI, ~14 GB) or
-**`gemma3:27b`** (Google, ~17 GB) or **`phi4`** (Microsoft, ~9 GB) on a ~32 GB GPU;
-**`llama3.1:8b`** / **`granite3.3:8b`** (IBM) for ~8 GB; **`llama3.2:3b`** / **`gemma3:4b`** /
-**`phi4-mini`** for CPU-only. Sizing: weights + KV(`num_ctx`) ≤ VRAM, else lower `num_ctx`.
+`brain.py` knobs: `MODEL` (any tag from `ollama list`), `num_ctx` (context window), `keep_alive`
+(`"30m"` — how long it stays in VRAM; `app.py`/`chat.py` run `ollama stop` on clean exit),
+`temperature` (`0.3` — low, this is diagnostics not creative writing).
+
+### 7.1 Which model for which GPU — the brain matrix
+
+Rule of thumb: **VRAM needed ≈ model weights + KV-cache(`num_ctx`)**. The KV cache for `num_ctx`
+tokens is roughly `num_ctx × n_layer × 2 × hidden × 2 bytes`; the practical numbers below already
+include it. Pick the largest model whose "≈VRAM @ ctx" fits with headroom for your desktop/games.
+All are one `ollama pull <tag>` and one edit to `MODEL` in `brain.py` — identical code path.
+
+| Model (`ollama pull`) | Origin | Weights | Good `num_ctx` | ≈VRAM (weights+KV) | Fits GPU | Notes |
+|---|---|---|---|---|---|---|
+| `qwen2.5:32b` **(default)** | Alibaba | ~19 GB | 32768 | ~28 GB | 32 GB (5090/4090-48) | best grounding here; the shipped default |
+| `gemma3:27b` | Google | ~17 GB | 16384 | ~23 GB | 24–32 GB | strong US-built alternative |
+| `gpt-oss:20b` | OpenAI | ~14 GB | 16384 | ~18 GB | 20–24 GB | US-built, roomy on 24 GB |
+| `qwen2.5:14b` | Alibaba | ~9 GB | 16384 | ~12 GB | 12–16 GB | great quality/size trade |
+| `phi4` (14b) | Microsoft | ~9 GB | 16384 | ~12 GB | 12–16 GB | US-built, sharp reasoning |
+| `qwen2.5:7b` / `llama3.1:8b` | Alibaba / Meta | ~5 GB | 16384 | ~7 GB | 8 GB (3070/4060) | the 8 GB sweet spot |
+| `granite3.3:8b` | IBM | ~5 GB | 8192 | ~7 GB | 8 GB | US-built (IBM), enterprise-tuned |
+| `llama3.2:3b` / `gemma3:4b` | Meta / Google | ~2–3 GB | 8192 | ~4 GB | 4–6 GB or CPU | usable on a small GPU |
+| `phi4-mini` / `qwen2.5:3b` | Microsoft / Alibaba | ~2 GB | 8192 | ~3 GB | CPU-ok | last resort, still grounded |
+
+If a model won't fit, **lower `num_ctx` first** (halving it roughly halves the KV cache) before
+dropping to a smaller model — grounding quality tracks model size more than context length here.
+On a shared desktop, leave 4–6 GB of VRAM free for the display/compositor and any game.
+
+> **Note — this is not a leaderboard.** All of these produce a grounded answer because the
+> *findings* and *live snapshot* are handed to the model as ground truth; a bigger model mainly
+> writes cleaner fix-it steps and follows the "advise-only / cite-the-numbers" rules more reliably.
+
+### 7.2 Embedding model (for the optional RAG in §12)
+
+Separate, tiny, and only loaded when you use RAG: `ollama pull mxbai-embed-large` (~670 MB,
+1024-dim — measured best on this repo's docs). `nomic-embed-text` (~270 MB, 768-dim) is a lighter
+alternative; switch `EMBED_MODEL` + the task prefixes in `rag.py` together (see §12).
 
 ---
 
@@ -3347,8 +3910,15 @@ Banner, then a prompt. Ask "Is my GPU temp normal?" — grounded answer. `exit` 
 python app.py
 ```
 Opens `http://127.0.0.1:7860`: host selector, live stats/findings panel (5 s), chat, live graphs,
-History graph. **Ctrl+C** to stop (frees VRAM). **Restart `app.py` after editing any `.py`** —
-Gradio caches modules.
+History graph, plus a **Search** accordion (query every logged snapshot by component / computer /
+date-time) and a **Shared notes** accordion (any user leaves a note the others see; persisted in
+`notes.db`). **Ctrl+C** to stop (frees VRAM). **Restart `app.py` after editing any `.py`** — Gradio
+caches modules. The port is env-overridable (`WATCHTOWER_PORT`) so a second instance can run
+alongside a local one.
+
+> The **History graph** and **Search** read `history.db`, which is filled by the scheduled
+> `history.py` logger (§10). A fresh install shows an empty graph until the logger has run a few
+> times — run `python history.py` a handful of times to seed it, or wait for the schedule.
 
 ---
 
@@ -3424,7 +3994,9 @@ Ollama is down. It adds **one file** (`rag.py`) and edits **one** (`context.py`)
 not change. Built to scale: it embeds in **batches** and indexes **incrementally**, so a large
 corpus builds in minutes and editing one doc re-embeds only that doc.
 
-1. **Pull an embedding model:** `ollama pull nomic-embed-text` and `pip install sqlite-vec`.
+1. **Pull an embedding model:** `ollama pull mxbai-embed-large` (`sqlite-vec` is already installed
+   from §6.1). `mxbai-embed-large` measured best on this repo's docs; `nomic-embed-text` is a
+   lighter alternative (switch `EMBED_MODEL` + the task prefixes together — see the note in `rag.py`).
 2. **Add `rag.py`** — the real file is embedded below.
 3. **Wire it into `context.py`** — the shipped `context.py` already calls
    `rag.context_block(message)` (see its source above), so no edit is needed if you use these
@@ -3432,8 +4004,11 @@ corpus builds in minutes and editing one doc re-embeds only that doc.
 4. **Build the index:** `python rag.py --build` (re-run anytime; `--build --force` re-embeds all).
 5. **Verify:** `python rag.py "how is my reverse proxy set up?"` returns ranked chunks.
 
-`rag.py`'s full source is in §5 above (it's a core file — `context.py` imports it). Tuning knobs
-live at its top (`TOP_K`, `MIN_SCORE`, `CHUNK_*`, the embed model + task prefixes) — the RAG
-equivalent of `rules.THRESH`. Lower `TOP_K` / raise `MIN_SCORE` if the context gets too big and
-the model starts replying in one line.
+`rag.py`'s full source is in §5 above (it's a core file — `context.py` imports it). It uses a
+**hybrid retrieval** step: fetch a vector-similarity pool, then re-rank by `0.6·cosine +
+0.4·(question↔chunk word overlap)` — the passage that both embeds near the question and shares its
+vocabulary. Measured on this repo: that rerank lifted MRR@5 from 0.79 to 0.95. Tuning knobs live at
+its top (`RERANK_POOL`/`RERANK_ALPHA`, `TOP_K`, `MIN_SCORE`, `CHUNK_*`, embed model + prefixes) —
+the RAG equivalent of `rules.THRESH`. Lower `TOP_K` / raise `MIN_SCORE` if the context gets too big
+and the model starts replying in one line.
 

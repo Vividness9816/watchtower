@@ -66,8 +66,21 @@ collectors/*.py ──► sysdiag.py ──► snapshot{{json}} ──► rules.
   schema.serialize ─► tiny GPT   context.build ─► brain.ask ─► Ollama   live.py ring ─► graphs
 ```
 
-Two independent "AIs": the **tiny GPT you train** (offline, ~44 MB) and the **32B Ollama model**
-(downloaded, ~19 GB). They are separate — run the dashboard with either, both, or neither.
+Two independent "AIs": the **tiny GPT you train** (offline, ~47 MB checkpoint, ~11 M params) and
+the **Ollama chat model** (downloaded, e.g. `qwen2.5:32b` ~19 GB — see §7 for the model matrix).
+They are separate — run the dashboard with either, both, or neither.
+
+Beyond the health panel the dashboard has: a **Host** selector (local, or many remote machines),
+**live graphs** and a **History graph**, a **Search** box (find any logged metric by component,
+computer, or date/time), and **shared Notes** (any user of the instance leaves notes the others
+see). A `sysdiag.py` run also returns a severity **exit code** (0 clean / 1 WARN / 2 CRIT) so
+Task Scheduler or CI can detect machine distress without parsing text.
+
+> **Network honesty:** Watch Tower is local-first (dashboard binds `127.0.0.1`, Ollama is local,
+> no API keys), but it is **not** zero-egress: `collectors/net.py` pings `1.1.1.1` and resolves a
+> DNS name over the internet each full-fleet cycle to measure connectivity, and remote mode streams
+> snapshots to the monitoring host. Everything else stays on the box. Delete/relax `net.py` if you
+> want a truly offline build.
 
 Beyond the basics this build includes: deep sensors (VRM/NVMe temps, AIO liquid temp, GPU
 throttle/PCIe), boot/power forensics, RGB state, Hyper-V/libvirt VM encryption posture, systemd
@@ -82,6 +95,17 @@ ML_CORE_INTRO = """## 3. The machine-learning core (offline tiny GPT)
 
 These files build, train, and run a character-level transformer with zero downloads. They are
 **identical across Windows and Linux** (pure Python + torch).
+
+**How to train the narrator** (details in §6.3): `data.py` synthesizes a deterministic corpus of
+`INPUT metrics → REPORT` documents from random-but-seeded snapshots (seed 1337, so `corpus.txt` is
+byte-reproducible); `gpt.py` is the ~11 M-param model (6 layers, 384-dim, `block_size=512` — large
+enough that the longest report fits the attention window so multi-finding reports aren't truncated
+mid-sentence); `train.py` runs ~3 min on a modern GPU (or ~20–30 min CPU) to val-loss ≈ 0.19 and
+writes `ckpt.pt` (~47 MB) + `vocab.json`; `infer.py --demo` shows INPUT / rule-truth / model-output
+side by side. **Retrain when** you change `schema.serialize_metrics`, `data.render_report`, or the
+corpus size — the model input/label contract changed. You do **not** need to retrain to add
+collectors or rules that the narrator's 10-metric input doesn't include (those surface via the
+rules engine and chat brain instead).
 """
 
 BUILD_STEPS = """## 6. Build it — step by step (with expected output)
@@ -106,10 +130,14 @@ Expected: `schema ok`, `rules ok`, `live ok — ...`, `docker parsers ok`.
 
 ### 6.3 Generate the corpus, train, test the GPT
 ```{sh}
-python data.py 8000        # -> wrote corpus.txt: 8000 docs, ...
-python train.py            # -> trains ~2-5 min on a CUDA GPU; writes ckpt.pt + vocab.json
+python data.py 8000        # -> wrote corpus.txt: 8000 docs (deterministic, seed 1337)
+python train.py            # -> ~3 min on a CUDA GPU (bf16) / ~20-30 min CPU; val loss ~0.19;
+#                             writes ckpt.pt (~47 MB) + vocab.json
 python infer.py --demo     # -> MODEL OUTPUT should read like the GROUND TRUTH
 ```
+> `corpus.txt`, `vocab.json`, and `ckpt.pt` are **generated artifacts** — regenerable and
+> git-ignored. `data.py` is deterministic, so the corpus reproduces byte-for-byte. Retrain
+> whenever you change `schema.serialize_metrics` / `data.render_report` / the corpus size.
 
 ### 6.4 Run the live collectors
 {collectors_run}
@@ -130,26 +158,51 @@ python sysdiag.py discover --spawn   # stub a collector for a recognized, uncove
 ---
 """
 
-OLLAMA = """## 7. Connect Ollama (the 32B chat model)
+OLLAMA = """## 7. Connect Ollama (the chat brain)
 
 1. Install Ollama — it serves on `127.0.0.1:11434`.
-2. Pull the model (~19 GB): `ollama pull qwen2.5:32b`
+2. Pull the default model (~19 GB): `ollama pull qwen2.5:32b`
 3. Verify: `ollama run qwen2.5:32b "say OK"` → `OK`.
 4. Check it's resident: `ollama ps`.
 
-> **Model / VRAM notes** (set in `brain.py`): `MODEL` = any pulled model (`ollama list`);
-> `num_ctx=32768` costs ~256 KB/token of KV cache for a 32B (~8 GB at 32k) — with the ~19 GB
-> weights that's ~28 GB, fits a 32 GB GPU; drop to `16384`/`8192` on a smaller GPU.
-> `keep_alive="30m"` keeps it warm; `app.py`/`chat.py` run `ollama stop` on clean exit.
-
 Smoke-test the brain (Ollama up): `python brain.py` → `brain ok: <a sentence about your machine>`.
 
-### US-built open-weight alternatives
-`brain.py` defaults to `qwen2.5:32b` (Alibaba). To run a US-built model, `ollama pull` one and set
-`MODEL` to that tag — same code path. Strong picks: **`gpt-oss:20b`** (OpenAI, ~14 GB) or
-**`gemma3:27b`** (Google, ~17 GB) or **`phi4`** (Microsoft, ~9 GB) on a ~32 GB GPU;
-**`llama3.1:8b`** / **`granite3.3:8b`** (IBM) for ~8 GB; **`llama3.2:3b`** / **`gemma3:4b`** /
-**`phi4-mini`** for CPU-only. Sizing: weights + KV(`num_ctx`) ≤ VRAM, else lower `num_ctx`.
+`brain.py` knobs: `MODEL` (any tag from `ollama list`), `num_ctx` (context window), `keep_alive`
+(`"30m"` — how long it stays in VRAM; `app.py`/`chat.py` run `ollama stop` on clean exit),
+`temperature` (`0.3` — low, this is diagnostics not creative writing).
+
+### 7.1 Which model for which GPU — the brain matrix
+
+Rule of thumb: **VRAM needed ≈ model weights + KV-cache(`num_ctx`)**. The KV cache for `num_ctx`
+tokens is roughly `num_ctx × n_layer × 2 × hidden × 2 bytes`; the practical numbers below already
+include it. Pick the largest model whose "≈VRAM @ ctx" fits with headroom for your desktop/games.
+All are one `ollama pull <tag>` and one edit to `MODEL` in `brain.py` — identical code path.
+
+| Model (`ollama pull`) | Origin | Weights | Good `num_ctx` | ≈VRAM (weights+KV) | Fits GPU | Notes |
+|---|---|---|---|---|---|---|
+| `qwen2.5:32b` **(default)** | Alibaba | ~19 GB | 32768 | ~28 GB | 32 GB (5090/4090-48) | best grounding here; the shipped default |
+| `gemma3:27b` | Google | ~17 GB | 16384 | ~23 GB | 24–32 GB | strong US-built alternative |
+| `gpt-oss:20b` | OpenAI | ~14 GB | 16384 | ~18 GB | 20–24 GB | US-built, roomy on 24 GB |
+| `qwen2.5:14b` | Alibaba | ~9 GB | 16384 | ~12 GB | 12–16 GB | great quality/size trade |
+| `phi4` (14b) | Microsoft | ~9 GB | 16384 | ~12 GB | 12–16 GB | US-built, sharp reasoning |
+| `qwen2.5:7b` / `llama3.1:8b` | Alibaba / Meta | ~5 GB | 16384 | ~7 GB | 8 GB (3070/4060) | the 8 GB sweet spot |
+| `granite3.3:8b` | IBM | ~5 GB | 8192 | ~7 GB | 8 GB | US-built (IBM), enterprise-tuned |
+| `llama3.2:3b` / `gemma3:4b` | Meta / Google | ~2–3 GB | 8192 | ~4 GB | 4–6 GB or CPU | usable on a small GPU |
+| `phi4-mini` / `qwen2.5:3b` | Microsoft / Alibaba | ~2 GB | 8192 | ~3 GB | CPU-ok | last resort, still grounded |
+
+If a model won't fit, **lower `num_ctx` first** (halving it roughly halves the KV cache) before
+dropping to a smaller model — grounding quality tracks model size more than context length here.
+On a shared desktop, leave 4–6 GB of VRAM free for the display/compositor and any game.
+
+> **Note — this is not a leaderboard.** All of these produce a grounded answer because the
+> *findings* and *live snapshot* are handed to the model as ground truth; a bigger model mainly
+> writes cleaner fix-it steps and follows the "advise-only / cite-the-numbers" rules more reliably.
+
+### 7.2 Embedding model (for the optional RAG in §12)
+
+Separate, tiny, and only loaded when you use RAG: `ollama pull mxbai-embed-large` (~670 MB,
+1024-dim — measured best on this repo's docs). `nomic-embed-text` (~270 MB, 768-dim) is a lighter
+alternative; switch `EMBED_MODEL` + the task prefixes in `rag.py` together (see §12).
 
 ---
 
@@ -166,8 +219,15 @@ Banner, then a prompt. Ask "Is my GPU temp normal?" — grounded answer. `exit` 
 {launch}
 ```
 Opens `http://127.0.0.1:7860`: host selector, live stats/findings panel (5 s), chat, live graphs,
-History graph. **Ctrl+C** to stop (frees VRAM). **Restart `app.py` after editing any `.py`** —
-Gradio caches modules.
+History graph, plus a **Search** accordion (query every logged snapshot by component / computer /
+date-time) and a **Shared notes** accordion (any user leaves a note the others see; persisted in
+`notes.db`). **Ctrl+C** to stop (frees VRAM). **Restart `app.py` after editing any `.py`** — Gradio
+caches modules. The port is env-overridable (`WATCHTOWER_PORT`) so a second instance can run
+alongside a local one.
+
+> The **History graph** and **Search** read `history.db`, which is filled by the scheduled
+> `history.py` logger (§10). A fresh install shows an empty graph until the logger has run a few
+> times — run `python history.py` a handful of times to seed it, or wait for the schedule.
 
 ---
 """
@@ -213,11 +273,24 @@ from `crit`≷`warn`), unreachable = WARN, ~20 s wall-clock budget. See `docs/IN
 # ------------------------------------------------------------------ collector lists
 
 WIN_COLLECTORS = [
-    ("cpu", ""), ("mem", ""), ("disk", ""), ("gpu", ""),
-    ("sensors", "Reads LibreHardwareMonitor's whole tree (all temps incl. AIO liquid, fans + pump);"
-                " `liquidctl` fallback for the AIO when LHM is down."),
-    ("net", ""), ("docker", ""), ("k3s", ""), ("whea", ""), ("tpm", ""), ("me", ""),
-    ("usb", ""), ("storage", ""),
+    ("cpu", "Core counts + live load + true current clock (turbo-aware) + fastest single-core clock."),
+    ("mem", "RAM used %, per-DIMM inventory, commit-charge % (the real allocation-pressure metric), DRAM speed."),
+    ("disk", "Used % AND absolute free GB per fixed drive (free GB lets rules downgrade a big-drive pct-CRIT)."),
+    ("gpu", "nvidia-smi: util/temp/power/VRAM + fan %, P-state, clocks, PCIe link gen/width, throttle reasons, driver."),
+    ("sensors", "Reads LibreHardwareMonitor's whole tree (all temps incl. AIO liquid, fans + pump, rail voltages,"
+                " power draws); `liquidctl` fallback for the AIO when LHM is down."),
+    ("net", "Ping 1.1.1.1 + gateway (LAN-vs-WAN fault isolation), NIC error counters, cold/warm DNS timing, resolver in use."),
+    ("docker", "Container states PARSED to numbers — running/restarting/unhealthy/exited/paused + explicit daemon reachability."),
+    ("k3s", "k3s pods via WSL; judges containerStatuses (catches CrashLoopBackOff that phase='Running' hides) + not-ready."),
+    ("whea", "Windows hardware-error channel — 7-day-WINDOWED uncorrected count + corrected-machine-check count, Level-based."),
+    ("tpm", "TPM presence/version via `tpmtool` (works UNELEVATED, unlike Get-Tpm)."),
+    ("me", "Intel Management Engine presence/version."),
+    ("usb", "USB device + problem-device counts."), ("storage", "Physical-drive inventory + SMART health/temp."),
+    ("os", "OS posture: uptime, pending-reboot, CPU microcode (14900K Vmin-shift fix = 0x12B+), BIOS, update age, Secure Boot."),
+    ("security", "Defender real-time protection + signature age, firewall, VBS/HVCI, BitLocker, failed-logon count."),
+    ("events", "Event-log health: WDDM TDR GPU resets (4101), app crashes (1000), NTFS corruption (55), failed scheduled tasks."),
+    ("procs", "Top CPU / RAM / per-process GPU-VRAM consumers (names the chat model's own footprint)."),
+    ("wsl", "The WSL2 utility VM Docker/k3s run inside — vmmem working set + ext4 vhdx size (both otherwise invisible)."),
     ("power", "Boot/power forensics from the event log (Kernel-Power 41 / 6008 / throttle 37)."),
     ("lights", "Board/RGB zone state via the OpenRGB SDK server (127.0.0.1:6742)."),
     ("vm", "Hyper-V VMs + their encryption posture (encrypted state, vTPM, Secure Boot, Shielded)."),
@@ -231,8 +304,8 @@ SDR_COLLECTORS = [
 
 # Modules common to both platforms (embedded from the real files).
 CORE_ML = ["schema.py", "rules.py", "data.py", "gpt.py", "train.py", "infer.py"]
-CORE_APP = ["sysdiag.py", "history.py", "live.py", "trends.py", "context.py", "rag.py",
-            "art.py", "app.py", "chat.py", "ship.py", "discover.py"]
+CORE_APP = ["sysdiag.py", "history.py", "live.py", "trends.py", "search.py", "notes.py",
+            "context.py", "rag.py", "art.py", "app.py", "chat.py", "ship.py", "discover.py"]
 
 
 def collectors_section_windows():
@@ -300,7 +373,8 @@ mkdir C:\\Users\\<you>\\sysdiag; cd C:\\Users\\<you>\\sysdiag; mkdir collectors,
         venv="```powershell\npython -m venv .venv\n.\\.venv\\Scripts\\Activate.ps1\n"
              "python -m pip install --upgrade pip\n"
              "pip install torch --index-url https://download.pytorch.org/whl/cu128\n"
-             "pip install gradio pandas\n"
+             "pip install gradio pandas sqlite-vec\n"
+             "# sqlite-vec powers the optional RAG (§12); everything else the app uses is stdlib.\n"
              "# optional deep-sensor deps: pip install liquidctl openrgb-python\n```",
         collectors_run="With LibreHardwareMonitor running:\n```powershell\npython collectors\\gpu.py\n"
                        "python collectors\\sensors.py\npython sysdiag.py\n```\n> `tpm` blank and"
@@ -360,9 +434,11 @@ stays populated.
 > smartmontools usbutils` then `sudo sensors-detect`. GPU/Docker/k3s/SSH collectors need their
 > respective tools (`nvidia-smi`, `docker`, `k3s`, `ssh`).
 >
-> **Omitted on Linux:** `tpm.py` and `me.py` are Windows-only (Get-Tpm / the Intel ME driver).
-> Skip them; the shared `rules.py` simply sees no `tpm`/`me` keys. If you want TPM state on
-> Linux, add a collector that reads `/sys/class/tpm/`.
+> **Omitted on Linux:** `tpm.py`, `me.py`, `os.py`, `security.py`, `events.py`, and `wsl.py` are
+> Windows-specific (Get-Tpm / Intel ME / registry+event-log / Defender+BitLocker / the WSL VM).
+> Skip them; the shared `rules.py` simply sees no such keys. Linux analogues if you want them:
+> TPM via `/sys/class/tpm/`, uptime via `/proc/uptime`, security via `ufw`/`aa-status`, events via
+> `journalctl`. `procs.py` below is the Linux port (psutil); the rest of the fleet is native.
 """
 
 LINUX_CPU = '''# collectors/cpu.py (Linux) — core counts + live load via psutil.
@@ -576,11 +652,47 @@ The Windows `discover.py` scans PnP + COM ports. On Linux, replace the `scan_pnp
 cross-platform, so only the scan front-end changes.
 """
 
+LINUX_PROCS = '''# collectors/procs.py (Linux) — top CPU / RAM consumers via psutil, plus per-process
+# GPU VRAM via nvidia-smi where present. Same keys the Windows procs.py emits.
+import json, shutil, subprocess
+try:
+    import psutil
+    for p in psutil.process_iter(["name"]):      # prime cpu_percent (first call returns 0.0)
+        try: p.cpu_percent()
+        except Exception: pass
+    import time; time.sleep(0.3)
+    rows = []
+    for p in psutil.process_iter(["name", "memory_info"]):
+        try:
+            rows.append((p.info["name"], p.cpu_percent(), p.info["memory_info"].rss))
+        except Exception:
+            continue
+    n = psutil.cpu_count() or 1
+    top_cpu = [{"name": nm, "cpu_pct": round(c / n, 1)} for nm, c, _ in
+               sorted(rows, key=lambda r: -r[1])[:5]]
+    top_mem = [{"name": nm, "mem_mb": int(m / 1048576)} for nm, _, m in
+               sorted(rows, key=lambda r: -r[2])[:5]]
+    out = {"top_cpu": top_cpu, "top_mem": top_mem}
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        r = subprocess.run([smi, "--query-compute-apps=process_name,used_memory",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=6)
+        gv = []
+        for ln in r.stdout.strip().splitlines():
+            if "," in ln:
+                nm, mb = ln.rsplit(",", 1)
+                try: gv.append({"name": nm.strip(), "vram_mb": int(float(mb))})
+                except ValueError: pass
+        out["top_gpu_vram"] = sorted(gv, key=lambda x: -x["vram_mb"])[:5]
+    print(json.dumps({"procs": out}))
+except Exception as e:
+    print(json.dumps({"procs": {"error": str(e)}}))'''
+
 LINUX_COLLECTOR_MAP = [
     ("cpu", LINUX_CPU, ""), ("mem", LINUX_MEM, ""), ("disk", LINUX_DISK, ""),
     ("sensors", LINUX_SENSORS, ""), ("net", LINUX_NET, ""), ("whea", LINUX_WHEA, ""),
     ("k3s", LINUX_K3S, ""), ("usb", LINUX_USB, ""), ("storage", LINUX_STORAGE, ""),
-    ("power", LINUX_POWER, ""), ("vm", LINUX_VM, ""),
+    ("power", LINUX_POWER, ""), ("vm", LINUX_VM, ""), ("procs", LINUX_PROCS, ""),
 ]
 # these collector files are cross-platform — embed the REAL repo file in the Linux guide too
 LINUX_SHARED_COLLECTORS = ["gpu", "docker", "services", "ssh",
@@ -659,7 +771,7 @@ mkdir -p ~/sysdiag/collectors ~/sysdiag/docs && cd ~/sysdiag
         venv="```bash\npython3 -m venv .venv\nsource .venv/bin/activate\n"
              "pip install --upgrade pip\n"
              "pip install torch --index-url https://download.pytorch.org/whl/cu128\n"
-             "pip install gradio pandas psutil\n```",
+             "pip install gradio pandas psutil sqlite-vec\n```",
         collectors_run="```bash\npython collectors/gpu.py\npython collectors/sensors.py\n"
                        "python sysdiag.py\n```\n> `storage` needs root for SMART; `whea`/`power`"
                        " read the journal (systemd-journal group or sudo)."))
@@ -706,7 +818,9 @@ Ollama is down. It adds **one file** (`rag.py`) and edits **one** (`context.py`)
 not change. Built to scale: it embeds in **batches** and indexes **incrementally**, so a large
 corpus builds in minutes and editing one doc re-embeds only that doc.
 
-1. **Pull an embedding model:** `ollama pull nomic-embed-text` and `pip install sqlite-vec`.
+1. **Pull an embedding model:** `ollama pull mxbai-embed-large` (`sqlite-vec` is already installed
+   from §6.1). `mxbai-embed-large` measured best on this repo's docs; `nomic-embed-text` is a
+   lighter alternative (switch `EMBED_MODEL` + the task prefixes together — see the note in `rag.py`).
 2. **Add `rag.py`** — the real file is embedded below.
 3. **Wire it into `context.py`** — the shipped `context.py` already calls
    `rag.context_block(message)` (see its source above), so no edit is needed if you use these
@@ -714,10 +828,13 @@ corpus builds in minutes and editing one doc re-embeds only that doc.
 4. **Build the index:** `python rag.py --build` (re-run anytime; `--build --force` re-embeds all).
 5. **Verify:** `python rag.py "how is my reverse proxy set up?"` returns ranked chunks.
 
-`rag.py`'s full source is in §5 above (it's a core file — `context.py` imports it). Tuning knobs
-live at its top (`TOP_K`, `MIN_SCORE`, `CHUNK_*`, the embed model + task prefixes) — the RAG
-equivalent of `rules.THRESH`. Lower `TOP_K` / raise `MIN_SCORE` if the context gets too big and
-the model starts replying in one line.
+`rag.py`'s full source is in §5 above (it's a core file — `context.py` imports it). It uses a
+**hybrid retrieval** step: fetch a vector-similarity pool, then re-rank by `0.6·cosine +
+0.4·(question↔chunk word overlap)` — the passage that both embeds near the question and shares its
+vocabulary. Measured on this repo: that rerank lifted MRR@5 from 0.79 to 0.95. Tuning knobs live at
+its top (`RERANK_POOL`/`RERANK_ALPHA`, `TOP_K`, `MIN_SCORE`, `CHUNK_*`, embed model + prefixes) —
+the RAG equivalent of `rules.THRESH`. Lower `TOP_K` / raise `MIN_SCORE` if the context gets too big
+and the model starts replying in one line.
 """
 
 

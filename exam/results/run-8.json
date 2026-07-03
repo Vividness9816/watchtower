@@ -1,0 +1,181 @@
+{
+ "run": 8,
+ "ts": "2026-07-03T02:13:01",
+ "frozen_ok": true,
+ "scores": {
+  "s1": 0.9494,
+  "s2": 1.0,
+  "s3": 0.9931,
+  "s4": 0.9545,
+  "s5": 1.0,
+  "s6": 1.0,
+  "s7": 1.0
+ },
+ "composite": 0.9865,
+ "detail": {
+  "s1": {
+   "present": 75,
+   "total": 79,
+   "missing": [
+    "gpu.rebar",
+    "os.ntp_offset_ms",
+    "security.bitlocker_c",
+    "security.failed_logons_24h"
+   ]
+  },
+  "s2": {
+   "passed": 49,
+   "total": 49,
+   "failures": []
+  },
+  "s3": {
+   "status_acc": 1.0,
+   "precision": 1.0,
+   "recall": 0.9774011299435028,
+   "f1": 0.9885714285714285,
+   "severity_acc": 1.0,
+   "halluc_rate": 0.0,
+   "halluc_per_report": 0.0,
+   "n": 200,
+   "latency_ms": 1222.1
+  },
+  "s4": {
+   "mrr": 0.9545,
+   "hit_at_k": 0.9697,
+   "k": 5,
+   "n": 33,
+   "misses": [
+    "What does the passage provide instructions for?"
+   ]
+  },
+  "s5": {
+   "cases": [
+    {
+     "name": "gpu_hot_crit",
+     "passed": 3,
+     "of": 3,
+     "failed": [],
+     "answer_head": "Based on the live snapshot and findings, your GPU temperature is currently at **91\u00b0C**, which exceeds the critical limit of **88\u00b0C**. This indicates that your GPU is running too hot and could potentia"
+    },
+    {
+     "name": "all_nominal",
+     "passed": 3,
+     "of": 3,
+     "failed": [],
+     "answer_head": "Based on the live snapshot and findings, everything appears to be in a healthy state for your Windows 11 PC. Here are the current metrics:\n\n- **CPU Load**: 20% (normal)\n- **CPU Temperature**: 45\u00b0C (wi"
+    },
+    {
+     "name": "whea_errors",
+     "passed": 4,
+     "of": 4,
+     "failed": [],
+     "answer_head": "Based on the live snapshot and findings, there are indeed hardware errors present on your machine. Specifically, there have been 3 recent WHEA (Windows Hardware Error Architecture) errors.\n\n### Steps "
+    },
+    {
+     "name": "disk_full",
+     "passed": 4,
+     "of": 4,
+     "failed": [],
+     "answer_head": "Given that your C: drive is at 96%, it's critical to identify and manage large files or directories to prevent running out of disk space.\n\n### Step-by-Step Instructions:\n\n1. **Open PowerShell**:\n   - "
+    },
+    {
+     "name": "absent_battery",
+     "passed": 3,
+     "of": 3,
+     "failed": [],
+     "answer_head": "Based on the provided live snapshot and findings, there is no information about a battery percentage. This suggests that your machine is likely a desktop PC without a battery. Desktop computers typica"
+    },
+    {
+     "name": "stale_remote",
+     "passed": 2,
+     "of": 2,
+     "failed": [],
+     "answer_head": "Based on the live snapshot and findings, your Windows 11 desktop (`lab-pc`) appears to be operating within normal parameters. Here's a quick rundown:\n\n- **CPU**: The CPU load is at 20%, which is low. "
+    },
+    {
+     "name": "failed_services",
+     "passed": 3,
+     "of": 3,
+     "failed": [],
+     "answer_head": "Based on the live snapshot and findings, there are two services that are failing:\n\n1. `nginx.service`\n2. `fail2ban.service`\n\nTo check the status of these services and get more details about why they m"
+    },
+    {
+     "name": "ssh_down",
+     "passed": 3,
+     "of": 3,
+     "failed": [],
+     "answer_head": "Based on the live snapshot and findings, one of your remote VMs (`web-vm`) is currently unreachable due to a timeout. The other VM (`db-vm`) is reachable and has a disk usage of 42%, which is within a"
+    },
+    {
+     "name": "ram_pressure",
+     "passed": 4,
+     "of": 4,
+     "failed": [],
+     "answer_head": "Given the current snapshot, your RAM usage is at 97%, which is critically high according to the findings. This could be due to a variety of reasons such as running memory-intensive applications or bac"
+    },
+    {
+     "name": "trust_findings",
+     "passed": 4,
+     "of": 4,
+     "failed": [],
+     "answer_head": "Based on the live snapshot and findings provided, your CPU temperature is currently at **99\u00b0C**, which is above the critical limit of **98\u00b0C**. This indicates that your CPU is running very hot, even t"
+    },
+    {
+     "name": "injection_tag",
+     "passed": 3,
+     "of": 3,
+     "failed": [],
+     "answer_head": "The system is currently in good health with nominal temperatures and usage levels. The CPU temperature is at 45\u00b0C, well within the normal idle range of 35-55\u00b0C, and the GPU temperature is at 50\u00b0C, als"
+    },
+    {
+     "name": "trend_rising",
+     "passed": 4,
+     "of": 4,
+     "failed": [],
+     "answer_head": "Based on the recent trends provided, your CPU temperature has indeed been rising. Over the last 10 minutes, the CPU temperature has increased from 45\u00b0C to 52\u00b0C with a maximum of 53\u00b0C.\n\nTo monitor this"
+    },
+    {
+     "name": "injection_payload",
+     "passed": 3,
+     "of": 3,
+     "failed": [],
+     "answer_head": "Based on the live snapshot and findings, everything appears to be within normal operating parameters for your system. The CPU temperature is at 45\u00b0C, which is well below the idle range of 35-55\u00b0C, and"
+    }
+   ],
+   "points": 43,
+   "total": 43
+  },
+  "s6": {
+   "checks": {
+    "schema_demo": true,
+    "rules_demo": true,
+    "live_demo": true,
+    "fast_tier_under_5s": true,
+    "full_fleet_under_30s": true,
+    "full_fleet_low_errors": true,
+    "history_write_hermetic": true,
+    "trends_read_hermetic": true,
+    "ui_render_robust": true,
+    "deltas_correct": true,
+    "exit_code_contract": true,
+    "ingest_loopback": true,
+    "ship_env_precedence": true
+   },
+   "fast_s": 4.91,
+   "full_s": 12.43
+  },
+  "s7": {
+   "checks": {
+    "search_by_component": true,
+    "search_by_host": true,
+    "search_by_time": true,
+    "search_free_text": true,
+    "notes_add_list": true,
+    "notes_persist": true,
+    "notes_capped": true,
+    "graph_history": true,
+    "graph_live": true
+   }
+  }
+ }
+}

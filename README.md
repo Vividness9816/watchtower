@@ -5,8 +5,8 @@
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![llm](https://img.shields.io/badge/LLM-Ollama%20qwen2.5%3A32b-green)
-![status](https://img.shields.io/badge/release-v1.0-brightgreen)
-![privacy](https://img.shields.io/badge/network-127.0.0.1%20only-orange)
+![status](https://img.shields.io/badge/release-v1.1-brightgreen)
+![privacy](https://img.shields.io/badge/network-local--first-orange)
 
 Watch Tower reads your machine's real sensors (CPU/GPU/RAM/disk/temps/Docker/…), turns them into
 plain-language health reports, and lets you *ask* about your hardware in a chat that's grounded in
@@ -19,8 +19,8 @@ ever executed.
 
 | | What | Size | Needs |
 |---|---|---|---|
-| **Tiny GPT** | A char-level transformer **you train from scratch** on synthetic snapshots. Writes a one-paragraph health report from a metrics line. | ~10 MB (`ckpt.pt`) | nothing — fully offline |
-| **Chat brain** | **Ollama** running `qwen2.5:32b`, grounded in the live snapshot + rule-engine findings. Answers free-form questions with copy-pasteable fix steps. | ~19 GB download | a CUDA GPU (32 GB ideal) |
+| **Tiny GPT** | A char-level transformer **you train from scratch** on synthetic snapshots. Writes a one-paragraph health report from a metrics line. | ~47 MB (`ckpt.pt`), ~11 M params | nothing — fully offline |
+| **Chat brain** | **Ollama** running `qwen2.5:32b` (or any model — see the [VRAM matrix](docs/INSTRUCTIONS.md#56-choosing-the-chat-brain-model-vram-matrix)), grounded in the live snapshot + rule-engine findings. Answers free-form questions with copy-pasteable fix steps. | ~19 GB download | a CUDA GPU (32 GB for 32B; smaller models fit less) |
 
 They're independent — run either, both, or neither.
 
@@ -57,11 +57,20 @@ collectors/*.py ──► sysdiag.py ──► snapshot{json} ──► rules.py
   training loop → sampling) trained offline in minutes. Great for learning how GPTs work.
 - 💬 **Grounded chat** — a 32B model that cites your actual numbers and never invents readings;
   told it can only advise, never act.
-- 📊 **History graph** — select by recent runs, hover any point for its date + time.
+- 📊 **History graph + Search** — plot recent runs (hover any point for its date + time), and
+  **search every logged snapshot by component, computer, or date/time**.
+- 📝 **Shared notes** — any user of the dashboard leaves a note the others see (SQLite-persistent).
+- 🧩 **Deep coverage** — 26 collectors: core hardware, rail voltages/power, SMART, boot forensics,
+  Docker/k3s (catches CrashLoopBackOff), Hyper-V, systemd, **OS posture** (uptime/microcode/
+  pending-reboot/Secure Boot), **security** (Defender/firewall/BitLocker/VBS), **event-log health**
+  (GPU TDR resets, NTFS corruption, failed scheduled tasks), top process consumers, and the WSL VM.
 - 🖥️ **Cross-platform** — Windows (PowerShell/CIM/WHEA collectors) and Linux
   (psutil/lm-sensors/MCE collectors).
-- 🔒 **Local-only** — binds `127.0.0.1`; no API keys, no env vars, no outbound calls (Ollama is
-  local too). Auto-frees the model's VRAM on exit.
+- 🔒 **Local-first** — binds `127.0.0.1`; no API keys; Ollama is local. The one deliberate internet
+  touch is a connectivity ping (`net.py` → `1.1.1.1` + a DNS resolve); remote mode streams to the
+  monitoring host. Auto-frees the model's VRAM on exit.
+- ⏱️ **Scriptable** — `sysdiag.py` exits `0`/`1`/`2` by worst severity, so Task Scheduler/CI can
+  alert on distress without parsing text.
 
 ---
 
@@ -120,18 +129,18 @@ python chat.py       # or the CLI
 
 | Command | What it does |
 |---|---|
-| `python sysdiag.py` | print live findings |
+| `python sysdiag.py` | print live findings (exit code `0`/`1`/`2` by worst severity) |
 | `python sysdiag.py diag --json` | full live snapshot as JSON |
-| `python sysdiag.py report` | tiny-GPT narration of the live snapshot |
-| `python data.py 8000` | (re)generate `corpus.txt` (8000 synthetic docs) |
-| `python train.py` | train the GPT → `ckpt.pt` + `vocab.json` |
-| `python infer.py --demo` | show INPUT / rule-truth / model-output for a random snapshot |
-| `python history.py` | log one snapshot to `history.db` (run on a timer) |
+| `python sysdiag.py report` | tiny-GPT narration of the live snapshot *(needs `ckpt.pt` — train first)* |
+| `python data.py 8000` | (re)generate `corpus.txt` (8000 synthetic docs, deterministic) |
+| `python train.py` | train the GPT → `ckpt.pt` (~47 MB) + `vocab.json` (~3 min GPU) |
+| `python infer.py --demo` | INPUT / rule-truth / model-output for a random snapshot *(needs `ckpt.pt`)* |
+| `python history.py` | log one snapshot to `history.db` (run on a timer; feeds History + Search) |
 | `python chat.py` | CLI chat |
-| `python app.py` | Gradio web dashboard |
+| `python app.py` | Gradio web dashboard (host selector, graphs, search, notes) |
 
-Each pure-logic module self-tests: `python schema.py`, `python rules.py`,
-`python collectors/docker.py --test` → `… ok`.
+Each pure-logic module self-tests: `python schema.py`, `python rules.py`, `python live.py`,
+`python notes.py`, `python search.py`, `python collectors/docker.py --test` → `… ok`.
 
 ---
 
@@ -140,13 +149,14 @@ Each pure-logic module self-tests: `python schema.py`, `python rules.py`,
 No env vars, no secrets. Tune these in source:
 
 - **`rules.py` → `THRESH`** — warn/crit thresholds per metric. *Tune for your silicon.*
-- **`brain.py`** — `MODEL` (any model you've `ollama pull`ed), `num_ctx` (context window; 32768
-  fits a 32 GB GPU — ~8 GB KV cache; drop to 16384/8192 on smaller GPUs), `keep_alive` (how long
-  the model stays in VRAM).
+- **`brain.py`** — `MODEL` (any model you've `ollama pull`ed — see the
+  [VRAM matrix](docs/INSTRUCTIONS.md#56-choosing-the-chat-brain-model-vram-matrix)), `num_ctx`
+  (context window; 32768 fits a 32 GB GPU; drop to 16384/8192 on smaller GPUs), `keep_alive`.
 - **`system_facts.md`** — static facts about your machine the chat model reads (CPU/GPU model,
   normal temps, what you care about). *Edit for your box.*
-- **`context.py` → `HOMELAB`** — optional path to a homelab doc; injected only when the question
-  is homelab-related (keyword-gated). Missing file is silently skipped.
+- **`rag.py`** — optional semantic retrieval over your `.md` docs (`EMBED_MODEL`, hybrid-rerank
+  knobs, chunk size). Off unless you `ollama pull mxbai-embed-large` and `python rag.py --build`.
+  See [`docs/ADD-RAG.md`](docs/ADD-RAG.md).
 
 ---
 
@@ -155,16 +165,19 @@ No env vars, no secrets. Tune these in source:
 ```
 schema.py rules.py data.py gpt.py train.py infer.py   # tiny GPT
 sysdiag.py history.py discover.py                      # truth layer + logger + bus discovery
-context.py brain.py                                    # Ollama chat brain
+context.py brain.py rag.py                              # Ollama chat brain + optional RAG
 art.py trends.py live.py app.py chat.py                # UI / CLI + live sampler
+search.py notes.py                                     # history search + shared multi-user notes
 ship.py discover.py                                   # remote-monitoring agent + bus discovery
+exam/                                                 # frozen RSI test harness (see RSI-REPORT.md)
 system_facts.md  requirements.txt  .gitignore
 ship.config.example.json  ssh.config.example.json     # copy → *.config.json (gitignored) to configure
 collectors/   cpu mem disk gpu sensors net docker k3s whea tpm me usb storage
               lights power vm services ssh             # RGB + boot forensics + Hyper-V + systemd + remote-VM SSH
               sdr rx tx tuner antenna  _sdr_common     # SDR/antenna skeletons (fill when hardware lands)
 docs/         INSTRUCTIONS.md  RECREATE-WINDOWS.md  RECREATE-LINUX.md  gen_recreate.py (generates the two RECREATE guides)
-# generated (git-ignored): corpus.txt* vocab.json ckpt.pt history.db   (*corpus is deterministic)
+# tracked for reproducibility: corpus.txt (deterministic) + vocab.json
+# git-ignored (regenerable/local): ckpt.pt  rag_index.db  history.db  notes.db  *.config.json
 ```
 
 **Deep sensors.** `sensors.py` reads LibreHardwareMonitor's whole tree (every temp — CPU/VRM/

@@ -1,0 +1,27 @@
+{
+ "run": 8,
+ "ts": "2026-07-03T02:13:01",
+ "dims_run": [
+  "s1",
+  "s2",
+  "s3",
+  "s4",
+  "s5",
+  "s6",
+  "s7"
+ ],
+ "dims_inherited": [],
+ "frozen_ok": true,
+ "scores": {
+  "s1": 0.9494,
+  "s2": 1.0,
+  "s3": 0.9931,
+  "s4": 0.9545,
+  "s5": 1.0,
+  "s6": 1.0,
+  "s7": 1.0
+ },
+ "composite": 0.9865,
+ "note": "FULL CERTIFICATION \u2014 all 7 dims fresh, no inheritance",
+ "seconds": 544.8
+}

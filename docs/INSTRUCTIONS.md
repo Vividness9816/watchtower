@@ -16,9 +16,10 @@ A local, **read-only** machine-health tool with three independent layers:
 1. **Truth layer** — `collectors/*.py` read real sensors and each print one JSON object;
    `sysdiag.py` runs them all in parallel and merges the result; `rules.py` turns that
    snapshot into severity-ranked findings. No model, no network required.
-2. **Tiny offline GPT** — `gpt.py` + `train.py` train a ~11 M-param char-level transformer on
-   *synthetic* snapshots so it learns to narrate a health report. ~44 MB checkpoint, no
-   downloads. (`schema.py`/`data.py`/`infer.py` support it.)
+2. **Tiny offline GPT** — `gpt.py` + `train.py` train a ~11 M-param char-level transformer
+   (6 layers, 384-dim, `block_size=512`) on *synthetic* snapshots so it learns to narrate a health
+   report. ~47 MB checkpoint, no downloads, ~3 min to train on a GPU. (`schema.py`/`data.py`/
+   `infer.py` support it; see §9 "Train / retrain the narrator".)
 3. **Chat brain** — `brain.py` + `context.py` talk to a local **Ollama** model
    (`qwen2.5:32b` by default), grounded in the live snapshot + findings + trends. Surfaced
    as a CLI (`chat.py`) and a Gradio web dashboard (`app.py`).
@@ -61,8 +62,10 @@ Every file, what it does, and its main knobs. "Knob" = something you're expected
 | File | Role | Key knobs |
 |---|---|---|
 | `live.py` | In-app background sampler. Two tiers: `FAST` collectors every `FAST_S`s, the full fleet every `FULL_S`s, in a ~1 h in-memory ring **per host**. Feeds the panel, live graphs, and chat. In `WATCHTOWER_REMOTE=1` it instead runs the HTTP receiver (`start_receiver`). | `FAST_S=5`, `FULL_S=60`, `FAST=[cpu,gpu,mem,sensors,disk]`, `METRICS` (graphable label→path), `SPANS` |
-| `history.py` | Appends one full snapshot to `history.db` (SQLite). Run on a timer (Task Scheduler / cron / systemd) for long-term history. | schedule interval |
-| `trends.py` | Reads `history.db` into a DataFrame for the History graph (run-count windows). | `METRICS`, `RUNS` |
+| `history.py` | Appends one full snapshot to `history.db` (SQLite, one row = `ts` + `host` + snapshot JSON, indexed on `(host,ts)`). Run on a timer (Task Scheduler / cron / systemd) for long-term history. | schedule interval; `WATCHTOWER_HISTORY_DB`, `WATCHTOWER_HISTORY_RETAIN_DAYS` |
+| `trends.py` | Reads `history.db` into a DataFrame for the History graph (run-count windows, host-filtered). | `METRICS`, `RUNS` |
+| `search.py` | Search every logged snapshot by **component** (substring of the metric's dotted path), **computer** (host), and **date/time** (since/until). Read-only; powers the dashboard's Search box and is scriptable (`python -c "import search; search.search(component='gpu.temp', host='lab-pc')"`). | `WATCHTOWER_HISTORY_DB` |
+| `notes.py` | Shared operator notes (SQLite, persistent, cross-process). Any user of the instance leaves a note the others see. Append + read only; text capped at 10 k, input validated (trust boundary). | `WATCHTOWER_NOTES_DB`, `MAX_TEXT` |
 
 ### Chat brain + retrieval
 
@@ -70,14 +73,14 @@ Every file, what it does, and its main knobs. "Knob" = something you're expected
 |---|---|---|
 | `brain.py` | The Ollama call. Builds the system prompt from `context.build`, POSTs to `127.0.0.1:11434/api/chat`. Read-only: the model only advises. | `MODEL="qwen2.5:32b"`, `num_ctx=32768`, `keep_alive="30m"`, `temperature=0.3`, `OLLAMA` URL |
 | `context.py` | Assembles the grounding context: static facts + live snapshot (age-stamped) + findings + `RECENT TRENDS` digest + RAG references. Prefers the live cache (0-cost chat); in remote mode reads the selected host and never falls back to local collectors. | `FACTS` path |
-| `rag.py` | Optional local semantic retrieval over your `.md` docs (Ollama embeddings + sqlite-vec). Read-only; degrades to silence. | `SOURCES`, `TOP_K`, `MIN_SCORE`, `CHUNK_*`, embed model |
+| `rag.py` | Optional local semantic retrieval over your `.md` docs (Ollama embeddings + sqlite-vec, **hybrid vector+lexical rerank**). Read-only; degrades to silence. | `SOURCES`, `EMBED_MODEL` (default `mxbai-embed-large`), `RERANK_POOL`/`RERANK_ALPHA`, `TOP_K`, `MIN_SCORE`, `CHUNK_*` |
 | `system_facts.md` | Static machine facts the chat reads every message (CPU/GPU model, normal temps, what you care about). | **edit for your box** |
 
 ### UI / CLI
 
 | File | Role | Key knobs |
 |---|---|---|
-| `app.py` | Gradio web dashboard (`127.0.0.1:7860`): host selector, live stats/findings panel, chat, live graphs, History graph. Starts the sampler/receiver (guarded by `gr.NO_RELOAD`). | port `7860`, default metrics/window |
+| `app.py` | Gradio web dashboard (`127.0.0.1:7860`): host selector, live stats/findings panel, chat, live graphs, History graph, **Search** accordion (by component/computer/date-time) and **Shared notes** accordion. Starts the sampler/receiver (guarded by `gr.NO_RELOAD`). | port via `WATCHTOWER_PORT` (default `7860`), default metrics/window |
 | `chat.py` | CLI chat — same model + context, no web server. | — |
 | `art.py` | The WATCH TOWER ASCII banner (truecolor), shared by CLI + web. | the art |
 
@@ -87,7 +90,7 @@ Every file, what it does, and its main knobs. "Knob" = something you're expected
 |---|---|
 | `gpt.py` | Char tokenizer + transformer (config + attention + full model). |
 | `data.py` | Synthesizes the training corpus from random snapshots (~35 % nudged hot). |
-| `train.py` | Trains the GPT, writes `ckpt.pt` + `vocab.json`. |
+| `train.py` | Trains the GPT (`block_size=512`, ~3 min GPU to val loss ~0.19), writes `ckpt.pt` (~47 MB) + `vocab.json`. See §9 for when to retrain. |
 | `infer.py` | Loads the checkpoint and generates a report from a serialized snapshot. |
 
 ### Remote / discovery
@@ -125,13 +128,27 @@ and what you follow when writing your own:
 
 ### The collectors, grouped
 
-- **Core hardware (also the `FAST` tier):** `cpu`, `gpu`, `mem`, `sensors`, `disk`.
-- **Deeper hardware / OS (full tier):** `net`, `storage`, `whea`, `tpm`, `me`, `usb`, `power`,
-  `lights`, `docker`, `k3s`.
-- **Remote / virtualization:** `vm` (Hyper-V + encryption posture), `services` (systemd, native
-  or via WSL), `ssh` (scrape remote Linux VMs — §8).
+- **Core hardware (also the `FAST` tier):** `cpu` (load + turbo-aware clock + fastest core),
+  `gpu` (util/temp/power/VRAM + throttle/PCIe/driver), `mem` (used % + commit-charge + DRAM speed),
+  `sensors` (LHM tree: temps, fans/pump, **rail voltages**, **power draws**), `disk` (used % +
+  **absolute free GB**).
+- **Deeper hardware (full tier):** `net` (ping + gateway + DNS timing + NIC errors), `storage`
+  (SMART), `whea` (**7-day-windowed** hardware errors + corrected machine-checks), `tpm`
+  (via unelevated `tpmtool`), `me`, `usb`, `power` (boot forensics), `lights` (OpenRGB).
+- **OS / security / diagnostics (Windows, full tier):** `os` (uptime, pending-reboot, **CPU
+  microcode**, BIOS, update age, Secure Boot), `security` (Defender, firewall, VBS, BitLocker,
+  failed logons), `events` (**GPU TDR resets**, app crashes, NTFS corruption, **failed scheduled
+  tasks**), `procs` (top CPU/RAM/GPU-VRAM consumers), `wsl` (the WSL2 VM's RAM + vhdx size).
+- **Containers / virtualization:** `docker` (running/restarting/unhealthy/exited + daemon
+  reachability), `k3s` (judges `containerStatuses`, catches CrashLoopBackOff), `vm` (Hyper-V +
+  encryption posture), `services` (systemd, native or via WSL), `ssh` (scrape remote Linux VMs — §8).
 - **SDR skeletons (fill when hardware arrives):** `sdr`, `rx`, `tx`, `tuner`, `antenna` + the
   shared `_sdr_common.py`. They emit `present:false` today and carry `FILL-ME` blocks.
+
+> **Windows-only collectors:** `tpm`, `me`, `os`, `security`, `events`, `wsl`. The Linux release
+> omits them (the shared `rules.py` just sees no such keys) and ports `cpu`/`mem`/`disk`/`sensors`/
+> `net`/`whea`/`power`/`vm`/`usb`/`storage`/`procs` to psutil/lm-sensors/journalctl — see
+> `docs/RECREATE-LINUX.md`.
 
 ---
 
@@ -236,6 +253,10 @@ collector — the snapshot glob then runs it, and you fill it in.
 | `WATCHTOWER_HOST` | `ship.py` | identity of this monitored machine in the payload (overrides config `host`) | `socket.gethostname()` |
 | `WATCHTOWER_SHIP_CONFIG` | `ship.py` | path to `ship.config.json` | `./ship.config.json` |
 | `WATCHTOWER_SSH_CONFIG` | `ssh.py` collector | path to `ssh.config.json` | `./ssh.config.json` |
+| `WATCHTOWER_PORT` | `app.py` | dashboard port (also honors `GRADIO_SERVER_PORT`) — lets a 2nd instance run alongside a local one | `7860` |
+| `WATCHTOWER_HISTORY_DB` | `history.py`/`trends.py`/`search.py` | override the history SQLite path | `./history.db` |
+| `WATCHTOWER_HISTORY_RETAIN_DAYS` | `history.py` | prune snapshots older than N days on each write (0 = keep all) | `0` |
+| `WATCHTOWER_NOTES_DB` | `notes.py` | override the shared-notes SQLite path | `./notes.db` |
 | `PYTHONIOENCODING=utf-8` | launch env | recommended when launching `app.py` so the banner + JSON print as UTF-8 on Windows | — |
 
 ### 5.2 Code-level knobs (edit the file)
@@ -272,6 +293,39 @@ collector — the snapshot glob then runs it, and you fill it in.
 - **Ollama** — `ollama pull qwen2.5:32b` (or your chosen `MODEL`).
 - **OpenRGB** (optional, for `lights.py`) — run its SDK server (port 6742).
 - **OpenSSH client** (for `ssh.py`) — ships with Windows 11 / every Linux.
+
+### 5.5 Ports
+
+| Port | Service | Bind | When |
+|---|---|---|---|
+| `7860` | Gradio dashboard (`app.py`) | `127.0.0.1` | always (override with `WATCHTOWER_PORT`) |
+| `7861` | Remote-ingest receiver (`live.start_receiver`) | `0.0.0.0` (override `WATCHTOWER_INGEST_BIND`) | remote mode only |
+| `8081` | NiFi `ListenHTTP` (optional middle hop) | NiFi host | if routing through NiFi |
+| `8085` | LibreHardwareMonitor web server | `127.0.0.1` | Windows sensors (`sensors.py`) |
+| `11434` | Ollama API | `127.0.0.1` | chat brain + RAG embeddings |
+| `6742` | OpenRGB SDK server | `127.0.0.1` | `lights.py` (optional) |
+
+### 5.6 Choosing the chat-brain model (VRAM matrix)
+
+`brain.py`'s `MODEL` is any tag you've `ollama pull`-ed; switching is one edit, same code path.
+**VRAM needed ≈ model weights + KV-cache(`num_ctx`)** — pick the largest that fits with headroom
+for your display/games. If it won't fit, **lower `num_ctx` before dropping model size** (grounding
+quality tracks model size more than context length, because the findings are handed to the model
+as ground truth regardless).
+
+| Model | Origin | Weights | `num_ctx` | ≈VRAM | Fits |
+|---|---|---|---|---|---|
+| `qwen2.5:32b` **(default)** | Alibaba | ~19 GB | 32768 | ~28 GB | 32 GB |
+| `gemma3:27b` | Google | ~17 GB | 16384 | ~23 GB | 24–32 GB |
+| `gpt-oss:20b` | OpenAI | ~14 GB | 16384 | ~18 GB | 20–24 GB |
+| `qwen2.5:14b` / `phi4` | Alibaba / Microsoft | ~9 GB | 16384 | ~12 GB | 12–16 GB |
+| `qwen2.5:7b` / `llama3.1:8b` / `granite3.3:8b` | Alibaba / Meta / IBM | ~5 GB | 16384/8192 | ~7 GB | 8 GB |
+| `llama3.2:3b` / `gemma3:4b` | Meta / Google | ~2–3 GB | 8192 | ~4 GB | 4–6 GB / CPU |
+| `phi4-mini` / `qwen2.5:3b` | Microsoft / Alibaba | ~2 GB | 8192 | ~3 GB | CPU-ok |
+
+The **embedding** model for RAG (§ `rag.py`) is separate and tiny — `mxbai-embed-large` (~670 MB,
+measured best here) or the lighter `nomic-embed-text` (~270 MB). It only loads when RAG is used.
+The full matrix with KV-cache math is in `docs/RECREATE-WINDOWS.md` §7.1.
 
 ---
 
@@ -475,9 +529,38 @@ $env:PYTHONIOENCODING = "utf-8"; python app.py
 Opens `http://127.0.0.1:7860`. Host selector, live panel (5 s), chat, live graphs, History graph.
 **Restart `app.py` after editing any `.py`** — Gradio caches modules.
 
-### History logging (the History graph's data)
+### History logging (the History graph's + Search data)
 Schedule `python history.py` every ~15 min (Windows Task Scheduler; Linux cron/systemd timer).
-See the RECREATE guide for the exact `Register-ScheduledTask` / crontab line.
+See the RECREATE guide for the exact `Register-ScheduledTask` / crontab line. A fresh install has
+an empty History graph and Search until the logger has run a few times — seed it by running
+`python history.py` several times, or wait for the schedule.
+
+### Exit code (for scripts / CI / Task Scheduler)
+`python sysdiag.py` returns a **severity exit code**: `0` = no findings, `1` = WARN only, `2` =
+CRIT present (`--json` always exits `0`). So a scheduled task can alert on distress without parsing
+text: e.g. `python sysdiag.py; if ($LASTEXITCODE -ge 2) { <page me> }`.
+
+### Search & notes
+Both are in the dashboard (accordions under the History graph) and scriptable:
+```
+python -c "import search; [print(r) for r in search.search(component='gpu.temp', host='lab-pc', since='2026-07-01T00:00:00')]"
+python -c "import notes; notes.add_note('dylan', 'RMA pending on the NZXT pump'); print(notes.list_notes())"
+```
+Search matches `component` as a substring of the metric's dotted path (`cpu_temp`, `gpu`, `disk`,
+`docker`…); blank fields mean *any*. Both read/write `history.db` / `notes.db` (override paths with
+`WATCHTOWER_HISTORY_DB` / `WATCHTOWER_NOTES_DB`).
+
+### Train / retrain the narrator (the tiny offline GPT)
+```
+python data.py 8000        # deterministic corpus (seed 1337) -> corpus.txt
+python train.py            # ~3 min GPU / ~20-30 min CPU; val loss ~0.19; writes ckpt.pt (~47 MB) + vocab.json
+python infer.py --demo     # INPUT / rule-truth / model-output side by side
+```
+`gpt.py` is ~11 M params (6 layers, 384-dim, `block_size=512`). **Retrain when** you change
+`schema.serialize_metrics`, `data.render_report`, or the corpus size — the model's input/label
+contract changed. You do **not** need to retrain to add collectors/rules the narrator's 10-metric
+input doesn't include (those surface via the rules engine and chat brain). `corpus.txt`/`vocab.json`
+/`ckpt.pt` are regenerable, git-ignored artifacts.
 
 ### Discover devices
 ```
@@ -491,8 +574,10 @@ python sysdiag.py discover --spawn   # write a stub collector for a recognized, 
 
 - **Read-only by design.** The chat model is told it only advises; nothing it returns is
   executed. Collectors read sensors; the SSH collector runs *your* read-only check commands.
-- **Local-first.** The dashboard binds `127.0.0.1:7860`; Ollama is local; no API keys, no
-  outbound calls (except the collectors' own localhost reads and the remote-ingest stream).
+- **Local-first, not zero-egress.** The dashboard binds `127.0.0.1:7860`; Ollama is local; no API
+  keys. The one deliberate internet touch is `collectors/net.py`, which pings `1.1.1.1` and resolves
+  a DNS name each full-fleet cycle to measure connectivity — delete/relax it for a truly offline
+  build. Remote mode also streams snapshots to the monitoring host. Everything else stays on the box.
 - **Remote ingest is authenticated** (shared token, constant-time compare, size-capped) and
   **isolated per host**. Remote snapshots are treated as semi-trusted: the rules engine is
   type-guarded so a malformed payload degrades to a finding instead of crashing the dashboard.
@@ -505,9 +590,11 @@ python sysdiag.py discover --spawn   # write a stub collector for a recognized, 
 ## 11. Quick index
 
 **Rebuild from scratch:** `docs/RECREATE-WINDOWS.md`, `docs/RECREATE-LINUX.md`.
-**Add semantic doc retrieval:** RECREATE §13 (`rag.py`).
+**Add semantic doc retrieval:** RECREATE §12 (`rag.py`).
 **Every collector:** `collectors/` — `cpu gpu mem sensors disk net storage whea tpm me usb power
-lights docker k3s vm services ssh` + skeletons `sdr rx tx tuner antenna` (+ `_sdr_common`).
-**Tune findings:** `rules.py` `THRESH`. **Tune graphs:** `live.py` `METRICS`. **Tune the model:**
-`brain.py` `MODEL`/`num_ctx`. **Remote:** `ship.py` + `ship.config.json` + `WATCHTOWER_*`.
-**SSH scrape:** `collectors/ssh.py` + `ssh.config.json`. **NiFi:** §7.
+lights docker k3s vm services ssh os security events procs wsl` + skeletons `sdr rx tx tuner
+antenna` (+ `_sdr_common`).
+**Tune findings:** `rules.py` `THRESH`. **Tune graphs:** `live.py` `METRICS`. **Choose the model:**
+`brain.py` `MODEL`/`num_ctx` (matrix §5.6). **Train the narrator:** `data.py`→`train.py`→`infer.py`
+(§9). **Search/notes:** `search.py`/`notes.py`. **Remote:** `ship.py` + `ship.config.json` +
+`WATCHTOWER_*`. **SSH scrape:** `collectors/ssh.py` + `ssh.config.json`. **NiFi:** §7. **Ports:** §5.5.
