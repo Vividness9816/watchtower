@@ -1,0 +1,167 @@
+[
+ {
+  "question": "What is the preferred format for redirecting both standard output and standard error?",
+  "answer_span": "Of the two forms, the first is preferred. This is semantically equivalent to",
+  "gold_doc": "linux-cmds.md"
+ },
+ {
+  "question": "What does the passage provide instructions for?",
+  "answer_span": "This article contains instructions for increasing the size of a Logical Volume using a Debian Linux VMware Virtual Machine (VM). This how-to information should work similarly with other Linux distributions.",
+  "gold_doc": "Linux-Storage.md"
+ },
+ {
+  "question": "How do you specify the host in the connection string for PostgreSQL?",
+  "answer_span": "conn = psycopg2.connect(host='postgres', user='postgres')",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "Can you customize Docker Hardened Images?",
+  "answer_span": "\u274c | \u2705 Up to 5 | \u2705 Unlimited",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "What command can be used to start a container and ensure the volume becomes usable when using Docker Desktop with a Windows-style path?",
+  "answer_span": "$ docker run --rm -ti -v C:\\Users\\user\\work:/work alpine",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "What causes the persistent notification regarding changes to my Docker Desktop configurations?",
+  "answer_span": "You receive this notification because the Configuration integrity check feature has detected that a third-party application has altered your Docker Desktop configuration.",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "What does the `audit_session_id` field represent in the record schema?",
+  "answer_span": "Identifies the daemon run that produced the record.",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "How do I create a filesystem access policy?",
+  "answer_span": "1. Sign in to [Docker Home](https://app.docker.com) and select your organization.\n1. Select **Admin Console**, then **AI governance**.\n1. Select **Network access** or **Filesystem access**, then **Create policy**.\n1. Enter a **Policy name**.\n1. Set the **Scope** to **Organization** or **Teams**. If you select **Teams**, choose the teams the policy applies to. See [Scope policies to teams](#scope-policies-to-teams).\n1. Select **Add rule** to add each rule. For rule syntax, see [Policy concepts](/ai/sandboxes/governance/org/concepts/#rule-syntax).",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "How can I display the status of my pod?",
+  "answer_span": "kubectl get pod",
+  "gold_doc": "kubernetes-troubleshooting.md"
+ },
+ {
+  "question": "What happens if the file descriptor number is not specified when using the redirection operator with '<'?",
+  "answer_span": "If the file descriptor number is omitted, and the first character of the redirection operator is '<', the redirection refers to the standard input (file descriptor 0).",
+  "gold_doc": "linux-cmds.md"
+ },
+ {
+  "question": "How can I disable specific checks in Dockerfile?",
+  "answer_span": "You can disable specific checks using `#check=skip=<check-name>`. To specify multiple checks to skip, separate them with a comma:",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "What is the difference between the long test and the short test?",
+  "answer_span": "The first: there is no time restriction and in the Read/Verify segment the entire disk is checked and not just a section.",
+  "gold_doc": "Linux-Storage.md"
+ },
+ {
+  "question": "What are the recommended settings for newer versions of fdisk?",
+  "answer_span": "Use the fdisk utility from util-linux-ng versions 2.17.2 or later Read the fdsik warnings. Deactivate DOS compatibility mode (the -c flag). Use sectors as display units (the -u flag). Use the +size(M, G) option in order to specify the end of a partition.",
+  "gold_doc": "Linux-Storage.md"
+ },
+ {
+  "question": "How can I get a random number using PowerShell?",
+  "answer_span": "Get-Random\tGet a random number.",
+  "gold_doc": "Windows-Powershell-cmds.md"
+ },
+ {
+  "question": "Where do I find the `settings-store.json` file on my Windows machine?",
+  "answer_span": "Windows: `C:\\Users\\[USERNAME]\\AppData\\Roaming\\Docker\\settings-store.json`",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "How can I validate the docker-compose.yml file?",
+  "answer_span": "# Validate docker-compose.yml\ndocker compose config",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "What is the purpose of the NET command in Windows?",
+  "answer_span": "NET Manage network resources",
+  "gold_doc": "Windows-cmds.md"
+ },
+ {
+  "question": "What happens if extdebug is set after the shell has started executing a script?",
+  "answer_span": "Setting extdebug after the shell has started to execute a script, or referencing this variable when extdebug is not set, may result in inconsistent values.",
+  "gold_doc": "linux-cmds.md"
+ },
+ {
+  "question": "What happens when using `--link` with COPY/ADD commands in terms of reading files from previous states?",
+  "answer_span": "When using `--link` the `COPY/ADD` commands are not allowed to read any files from the previous state.",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "Does the RAID controller display SMART data for block devices even if it hasn't passed that information to the operating system?",
+  "answer_span": "The type of block devices is necessary, but the SMART data on the disk that has the appropriate device ID will always be displayed on the RAID controller. For example, this can also display SMART data from hard disks that has not been passed on by the RAID controller to the operating system.",
+  "gold_doc": "Linux-Storage.md"
+ },
+ {
+  "question": "What command should be used to restart the NRPE server after configuring it?",
+  "answer_span": ":~$ sudo service nagios-nrpe-server restart",
+  "gold_doc": "Linux-Storage.md"
+ },
+ {
+  "question": "What does Docker Scout do to help enhance software supply chain security?",
+  "answer_span": "Docker Scout is a solution for proactively enhancing your software supply chain security.",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "What are the allocated resources for cpu and memory?",
+  "answer_span": "Resource           Requests     Limits\n  --------           --------     ------\n  cpu                1100m (55%)  1 (50%)\n  memory             456Mi (24%)  256Mi (13%)\n  ephemeral-storage  0 (0%)       0 (0%)\n  hugepages-2Mi      0 (0%)       0 (0%)",
+  "gold_doc": "kubernetes-troubleshooting.md"
+ },
+ {
+  "question": "What is the default security mode for the RUN command in Dockerfile?",
+  "answer_span": "The default security mode is `sandbox`.",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "What is the Spin_Up_Time value and its worst recorded value?",
+  "answer_span": "3 Spin_Up_Time            0x0027   144   143   021    Pre-fail  Always       -       3775",
+  "gold_doc": "Linux-Storage.md"
+ },
+ {
+  "question": "Where is the FDVDenyWriteAccess setting located in the Windows registry?",
+  "answer_span": "In the Windows registry it can be found at `HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Policies\\Microsoft\\FVE\\FDVDenyWriteAccess`.",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "What command is used to alter the partition table and what message confirms that it has been altered?",
+  "answer_span": "Command (m for help): w",
+  "gold_doc": "Linux-Storage.md"
+ },
+ {
+  "question": "How can I remove all custom rules and start fresh with a new preset?",
+  "answer_span": "To remove all custom rules and start fresh with a new preset, use\n`sbx policy reset`:",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "How do I create an interactive shell on a Node using kubectl debug?",
+  "answer_span": "kubectl debug node/mynode -it --image=ubuntu",
+  "gold_doc": "kubernetes-troubleshooting.md"
+ },
+ {
+  "question": "Where can I ask for help if my question isn't covered in the documentation?",
+  "answer_span": "If you have questions related to software development for your containerized app, you can ask those on Stack Overflow.",
+  "gold_doc": "kubernetes-troubleshooting.md"
+ },
+ {
+  "question": "How can I verify that the postgres server is correctly linked in the python_box container?",
+  "answer_span": "You can verify this by viewing the /etc/hosts file within the python_box container:",
+  "gold_doc": "Docker-Troubleshooting.md"
+ },
+ {
+  "question": "How do I perform tests in Foreground Mode using smartctl?",
+  "answer_span": "To perform the tests in Foreground Mode a \"-C\" must be added to the command.",
+  "gold_doc": "Linux-Storage.md"
+ },
+ {
+  "question": "How do you run commandA and then run commandB asynchronously?",
+  "answer_span": "commandA & commandB     Run commandA and then run commandB (asynchronous).",
+  "gold_doc": "linux-cmds.md"
+ }
+]
