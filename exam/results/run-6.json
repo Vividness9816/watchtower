@@ -1,0 +1,20 @@
+{
+ "run": 6,
+ "ts": "2026-07-02T22:12:50",
+ "frozen_ok": true,
+ "scores": {
+  "s4": 0.9545
+ },
+ "composite": null,
+ "detail": {
+  "s4": {
+   "mrr": 0.9545,
+   "hit_at_k": 0.9697,
+   "k": 5,
+   "n": 33,
+   "misses": [
+    "What does the passage provide instructions for?"
+   ]
+  }
+ }
+}
