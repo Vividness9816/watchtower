@@ -31,6 +31,9 @@ def search(component=None, host=None, since=None, until=None, limit=2000):
     """
     if not DB.exists():
         return []
+    if component is not None:
+        component = str(component)[:200]      # cap: a metric path is short; a huge string would
+        #                                       turn the per-row substring scan into a DoS
     where, params = [], []
     if host is not None:
         where.append("host = ?"); params.append(host)

@@ -16,6 +16,9 @@ LOCAL_HOST = socket.gethostname()
 FAST_S, FULL_S = 5, 60
 FAST = ["cpu", "gpu", "mem", "sensors", "disk"]     # cheap collectors, safe at 5s cadence
 KEEP = 3600 // FAST_S                               # ~1h of points
+MAX_HOSTS = 256                                     # cap distinct reporters — one authenticated
+#                                                    agent minting unlimited host names must not
+#                                                    grow _hosts (each ~a 1h ring) without bound
 
 # Friendly label -> path into the snapshot (superset of trends.METRICS: the deep keys too)
 METRICS = {
@@ -72,6 +75,8 @@ def _record(fresh, merge, host, extra=None):
         errs = [str(errs)]                # crash _record (it's summed with the other tier's list)
     now = time.time()
     with _lock:
+        if host not in _hosts and len(_hosts) >= MAX_HOSTS:
+            return                              # cardinality cap reached — ignore new reporters
         st = _hosts.get(host) or _hosts.setdefault(host, _new_host())
         if merge:                                   # fast tier: authoritative for its own errors
             st["errs"]["fast"] = errs

@@ -534,8 +534,11 @@ LINUX_WHEA = '''# collectors/whea.py (Linux) — Linux has no WHEA; the equivale
 # schema.py/rules.py are unchanged. (journalctl -k may need the systemd-journal group / root.)
 import json, subprocess
 try:
-    out = subprocess.run(["journalctl", "-k", "--since", "-24h", "--no-pager"],
-                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20).stdout
+    try:
+        out = subprocess.run(["journalctl", "-k", "--since", "-24h", "--no-pager"],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20).stdout
+    except FileNotFoundError:                     # non-systemd box: no journalctl != broken
+        print(json.dumps({"whea": {"present": False, "note": "journalctl not available"}})); raise SystemExit
     errs = [ln for ln in out.splitlines() if "Hardware Error" in ln or "mce:" in ln.lower() or "MCE" in ln]
     print(json.dumps({"whea": {"recent_errors": len(errs), "latest": (errs[-1][:200] if errs else None)}}))
 except Exception as e:
@@ -547,9 +550,19 @@ LINUX_K3S = '''# collectors/k3s.py (Linux) — k3s runs natively. Uses `sudo -n`
 import json, subprocess
 K3S_CMD = ["sudo", "-n", "k3s", "kubectl", "get", "pods", "-A", "-o", "json"]
 try:
-    r = subprocess.run(K3S_CMD, capture_output=True, text=True, timeout=25)
+    try:
+        r = subprocess.run(K3S_CMD, capture_output=True, text=True, timeout=25)
+    except FileNotFoundError:
+        print(json.dumps({"k3s": {"present": False, "note": "k3s/sudo not found"}})); raise SystemExit
     if r.returncode != 0:
-        print(json.dumps({"k3s": {"error": (r.stderr or "kubectl failed").strip()[:200]}}))
+        err = (r.stderr or "kubectl failed").strip()
+        # a sudo/permission problem is a CONFIG issue, not a broken cluster — degrade to a note
+        # (present:false) instead of an error, so an unattended box without passwordless sudo
+        # doesn't fire a WARN every run. Adjust K3S_CMD (kubeconfig / drop sudo) to enable.
+        if any(w in err.lower() for w in ("sudo", "password", "authentication", "permission")):
+            print(json.dumps({"k3s": {"present": False, "note": "kubectl not reachable (sudo/kubeconfig): " + err[:120]}}))
+        else:
+            print(json.dumps({"k3s": {"error": err[:200]}}))
     else:
         items = json.loads(r.stdout).get("items", [])
         pods = [{"name": i["metadata"]["name"], "namespace": i["metadata"]["namespace"],
@@ -602,7 +615,13 @@ LINUX_POWER = '''# collectors/power.py (Linux) — power/boot forensics: unclean
 # analogue of the Windows Kernel-Power 41 / throttle-37 collector. Keys mirror the Windows one.
 import json, subprocess
 def jr(*a):
-    return subprocess.run(a, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20).stdout
+    # a MISSING optional tool (last/journalctl not installed) is not a broken data source —
+    # return "" so that signal just reads 0, never erroring the whole collector.
+    try:
+        return subprocess.run(a, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=20).stdout
+    except FileNotFoundError:
+        return ""
 try:
     boots = jr("journalctl", "--list-boots", "--no-pager")
     # an unclean shutdown shows a boot with no clean "systemd-shutdown" at its tail; approximate

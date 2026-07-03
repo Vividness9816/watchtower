@@ -1097,8 +1097,11 @@ except Exception as e:
 # schema.py/rules.py are unchanged. (journalctl -k may need the systemd-journal group / root.)
 import json, subprocess
 try:
-    out = subprocess.run(["journalctl", "-k", "--since", "-24h", "--no-pager"],
-                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20).stdout
+    try:
+        out = subprocess.run(["journalctl", "-k", "--since", "-24h", "--no-pager"],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20).stdout
+    except FileNotFoundError:                     # non-systemd box: no journalctl != broken
+        print(json.dumps({"whea": {"present": False, "note": "journalctl not available"}})); raise SystemExit
     errs = [ln for ln in out.splitlines() if "Hardware Error" in ln or "mce:" in ln.lower() or "MCE" in ln]
     print(json.dumps({"whea": {"recent_errors": len(errs), "latest": (errs[-1][:200] if errs else None)}}))
 except Exception as e:
@@ -1114,9 +1117,19 @@ except Exception as e:
 import json, subprocess
 K3S_CMD = ["sudo", "-n", "k3s", "kubectl", "get", "pods", "-A", "-o", "json"]
 try:
-    r = subprocess.run(K3S_CMD, capture_output=True, text=True, timeout=25)
+    try:
+        r = subprocess.run(K3S_CMD, capture_output=True, text=True, timeout=25)
+    except FileNotFoundError:
+        print(json.dumps({"k3s": {"present": False, "note": "k3s/sudo not found"}})); raise SystemExit
     if r.returncode != 0:
-        print(json.dumps({"k3s": {"error": (r.stderr or "kubectl failed").strip()[:200]}}))
+        err = (r.stderr or "kubectl failed").strip()
+        # a sudo/permission problem is a CONFIG issue, not a broken cluster — degrade to a note
+        # (present:false) instead of an error, so an unattended box without passwordless sudo
+        # doesn't fire a WARN every run. Adjust K3S_CMD (kubeconfig / drop sudo) to enable.
+        if any(w in err.lower() for w in ("sudo", "password", "authentication", "permission")):
+            print(json.dumps({"k3s": {"present": False, "note": "kubectl not reachable (sudo/kubeconfig): " + err[:120]}}))
+        else:
+            print(json.dumps({"k3s": {"error": err[:200]}}))
     else:
         items = json.loads(r.stdout).get("items", [])
         pods = [{"name": i["metadata"]["name"], "namespace": i["metadata"]["namespace"],
@@ -1181,7 +1194,13 @@ except Exception as e:
 # analogue of the Windows Kernel-Power 41 / throttle-37 collector. Keys mirror the Windows one.
 import json, subprocess
 def jr(*a):
-    return subprocess.run(a, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20).stdout
+    # a MISSING optional tool (last/journalctl not installed) is not a broken data source —
+    # return "" so that signal just reads 0, never erroring the whole collector.
+    try:
+        return subprocess.run(a, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=20).stdout
+    except FileNotFoundError:
+        return ""
 try:
     boots = jr("journalctl", "--list-boots", "--no-pager")
     # an unclean shutdown shows a boot with no clean "systemd-shutdown" at its tail; approximate
@@ -2210,6 +2229,9 @@ LOCAL_HOST = socket.gethostname()
 FAST_S, FULL_S = 5, 60
 FAST = ["cpu", "gpu", "mem", "sensors", "disk"]     # cheap collectors, safe at 5s cadence
 KEEP = 3600 // FAST_S                               # ~1h of points
+MAX_HOSTS = 256                                     # cap distinct reporters — one authenticated
+#                                                    agent minting unlimited host names must not
+#                                                    grow _hosts (each ~a 1h ring) without bound
 
 # Friendly label -> path into the snapshot (superset of trends.METRICS: the deep keys too)
 METRICS = {
@@ -2266,6 +2288,8 @@ def _record(fresh, merge, host, extra=None):
         errs = [str(errs)]                # crash _record (it's summed with the other tier's list)
     now = time.time()
     with _lock:
+        if host not in _hosts and len(_hosts) >= MAX_HOSTS:
+            return                              # cardinality cap reached — ignore new reporters
         st = _hosts.get(host) or _hosts.setdefault(host, _new_host())
         if merge:                                   # fast tier: authoritative for its own errors
             st["errs"]["fast"] = errs
@@ -2583,6 +2607,9 @@ def search(component=None, host=None, since=None, until=None, limit=2000):
     """
     if not DB.exists():
         return []
+    if component is not None:
+        component = str(component)[:200]      # cap: a metric path is short; a huge string would
+        #                                       turn the per-row substring scan into a DoS
     where, params = [], []
     if host is not None:
         where.append("host = ?"); params.append(host)
@@ -3207,8 +3234,20 @@ if __name__ == "__main__":
 ```python
 """app.py — Watch Tower: live stats, chat, history graphs, search, and shared notes.
 READ-ONLY, 127.0.0.1 only."""
+import html
 import gradio as gr
 import schema, brain, context, art, trends, live, search, notes
+
+
+def _md_safe(s) -> str:
+    """Neutralize markdown/HTML in user- or remote-supplied text before it hits gr.Markdown.
+    Notes and remote label/tags/_note are prose shown to OTHER users of the dashboard, so an
+    unescaped `<img onerror=…>` or `[x](javascript:…)` would be stored XSS. HTML-escape kills the
+    raw-HTML vector; escaping the markdown link/emphasis metacharacters kills the rest."""
+    out = html.escape(str(s), quote=True)
+    for ch in "[]()`*_~":
+        out = out.replace(ch, "\\" + ch)
+    return out
 
 if gr.NO_RELOAD:   # guard: `gradio app.py` reload mode re-imports modules — without this,
     #              every source edit would leak one more immortal sampler thread.
@@ -3239,16 +3278,18 @@ def stats_md(host) -> str:
     live.set_focus(host)                    # default for the host=None fallback path (CLI chat)
     snap, findings = context.snapshot_and_findings(host)   # explicit host: no cross-tab clobber
     head = schema.summarize(snap)
-    ident = snap.get("_host", host)
+    # _host/_label/_tags/_note come from a remote agent's payload (semi-trusted); escape them and
+    # the finding text before they hit gr.Markdown so a hostile payload can't inject stored XSS.
+    ident = _md_safe(snap.get("_host", host))
     label = snap.get("_label")
     age = snap.get("_snapshot_age_s")
     fresh = f" *(sampled {age}s ago)*" if age is not None else ""
-    title = f"### {ident}" + (f" — {label}" if label else "") + fresh
+    title = f"### {ident}" + (f" — {_md_safe(label)}" if label else "") + fresh
     lines = [f"{title}\n{head}", "", "### Findings"]
     if findings:
         order = {"CRIT": 0, "WARN": 1}
         for f in sorted(findings, key=lambda x: order.get(x["level"], 9)):
-            lines.append(f"- **[{f['level']}]** {f['what']}: {f['value']}{f['unit']}")
+            lines.append(f"- **[{f['level']}]** {_md_safe(f['what'])}: {_md_safe(f['value'])}{_md_safe(f['unit'])}")
     else:
         lines.append("- OK — no findings")
     d = snap.get("docker", {})
@@ -3256,9 +3297,9 @@ def stats_md(host) -> str:
         lines.append(f"\n**Docker:** {d.get('running')}/{d.get('total')} running")
     tags = snap.get("_tags")
     if isinstance(tags, dict) and tags:
-        lines.append("\n" + " · ".join(f"`{k}={v}`" for k, v in tags.items()))
+        lines.append("\n" + " · ".join(f"`{_md_safe(k)}={_md_safe(v)}`" for k, v in tags.items()))
     if "_note" in snap:
-        lines.append(f"\n> {snap['_note']}")
+        lines.append(f"\n> {_md_safe(snap['_note'])}")
     return "\n".join(lines)
 
 
@@ -3282,8 +3323,9 @@ def render_notes():
     ns = notes.list_notes()
     if not ns:
         return "*No notes yet — be the first to leave one.*"
-    return "\n".join(f"- **{n['user']}** · *{n['ts']}*"
-                     + (f" · `{n['host']}`" if n.get("host") else "") + f"  \n  {n['text']}"
+    return "\n".join(f"- **{_md_safe(n['user'])}** · *{n['ts']}*"
+                     + (f" · `{_md_safe(n['host'])}`" if n.get("host") else "")
+                     + f"  \n  {_md_safe(n['text'])}"
                      for n in ns)
 
 

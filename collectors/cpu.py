@@ -9,6 +9,11 @@ ps = (r"$c=Get-CimInstance Win32_Processor;"
       r"CounterSamples.CookedValue;"
       r"if($null -eq $l){$l=(Get-Counter '\Processor(_Total)\% Processor Time' -EA SilentlyContinue)."
       r"CounterSamples.CookedValue};"
+      # final fallback: Win32_Processor.LoadPercentage is locale-INDEPENDENT, so `load` (which
+      # feeds the frozen model input) is never null just because the perf-counter NAMES are
+      # localized on a non-English Windows.
+      r"if($null -eq $l){$l=(Get-CimInstance Win32_Processor -EA SilentlyContinue|"
+      r"Measure-Object LoadPercentage -Average).Average};"
       r"$load=if($null -ne $l){[math]::Min(100,[int]$l)}else{$null};"
       r"$perf=(Get-Counter '\Processor Information(_Total)\% Processor Performance' "
       r"-EA SilentlyContinue).CounterSamples.CookedValue;"
