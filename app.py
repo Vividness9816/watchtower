@@ -1,6 +1,7 @@
-"""app.py — Watch Tower: live stats, chat, and history graphs. READ-ONLY, 127.0.0.1 only."""
+"""app.py — Watch Tower: live stats, chat, history graphs, search, and shared notes.
+READ-ONLY, 127.0.0.1 only."""
 import gradio as gr
-import schema, brain, context, art, trends, live
+import schema, brain, context, art, trends, live, search, notes
 
 if gr.NO_RELOAD:   # guard: `gradio app.py` reload mode re-imports modules — without this,
     #              every source edit would leak one more immortal sampler thread.
@@ -54,8 +55,37 @@ def stats_md(host) -> str:
     return "\n".join(lines)
 
 
-def plot(metric, rng):
-    return trends.series(metric, rng)
+def plot(metric, rng, host):
+    # History is per-host too (history.py stamps the host); None/"" host = all machines
+    return trends.series(metric, rng, host=host if host and host != WAITING else None)
+
+
+# ---- Search: by component, by computer, by date/time ----
+def do_search(component, host, since, until):
+    h = host if host and host not in ("(any)", WAITING) else None
+    rows = search.search(component=(component or None), host=h,
+                         since=(since or None), until=(until or None), limit=500)
+    if not rows:
+        return [["(no matches)", "", "", ""]]
+    return [[r["ts"], r["host"], r["metric"], r["value"]] for r in rows[:500]]
+
+
+# ---- Shared notes: any user of this instance can leave one, everyone sees them ----
+def render_notes():
+    ns = notes.list_notes()
+    if not ns:
+        return "*No notes yet — be the first to leave one.*"
+    return "\n".join(f"- **{n['user']}** · *{n['ts']}*"
+                     + (f" · `{n['host']}`" if n.get("host") else "") + f"  \n  {n['text']}"
+                     for n in ns)
+
+
+def post_note(user, text):
+    try:
+        notes.add_note(user, text, host=live.get_focus() or "")
+    except ValueError as e:
+        return render_notes() + f"\n\n> ⚠️ {e}", user, text
+    return render_notes(), user, ""      # clear the note box, keep the name
 
 
 _init_hosts = live.hosts()
@@ -113,11 +143,35 @@ with gr.Blocks(title="Watch Tower") as app:
     with gr.Row():
         metric = gr.Dropdown(list(trends.METRICS), value="CPU temp (C)", label="Component / metric")
         runs = gr.Dropdown(list(trends.RUNS), value="Last 25 runs", label="Show")
-    graph = gr.LinePlot(trends.series("CPU temp (C)", "Last 25 runs"),
+    graph = gr.LinePlot(trends.series("CPU temp (C)", "Last 25 runs", host=_init_host if _init_host != WAITING else None),
                         x="time", y="value", tooltip=["when", "value"],
                         title="History", height=320)
-    metric.change(plot, [metric, runs], graph)
-    runs.change(plot, [metric, runs], graph)
+    metric.change(plot, [metric, runs, host_sel], graph)
+    runs.change(plot, [metric, runs, host_sel], graph)
+    host_sel.change(plot, [metric, runs, host_sel], graph)
+
+    with gr.Accordion("🔎 Search history — by component, computer, or date/time", open=False):
+        gr.Markdown("Search every logged snapshot. **Component** is a substring of the metric "
+                    "path (`cpu_temp`, `gpu`, `disk`, `docker`…). Leave a field blank for *any*.")
+        with gr.Row():
+            s_comp = gr.Textbox(label="Component / metric", value="cpu_temp", scale=2)
+            s_host = gr.Textbox(label="Computer (host)", placeholder="(any)", scale=1)
+            s_since = gr.Textbox(label="Since", placeholder="2026-07-01T00:00:00", scale=1)
+            s_until = gr.Textbox(label="Until", placeholder="2026-07-02T23:59:59", scale=1)
+        s_btn = gr.Button("Search", variant="primary")
+        s_results = gr.Dataframe(headers=["when", "computer", "metric", "value"],
+                                 label="Results (newest first, up to 500)", wrap=True)
+        s_btn.click(do_search, [s_comp, s_host, s_since, s_until], s_results)
+
+    with gr.Accordion("📝 Shared notes — leave a note for other users of this dashboard", open=False):
+        notes_md = gr.Markdown(render_notes())
+        with gr.Row():
+            n_user = gr.Textbox(label="Your name", placeholder="e.g. dylan", scale=1)
+            n_text = gr.Textbox(label="Note", placeholder="e.g. RMA'd the NZXT pump — AIO temps are stale",
+                                scale=3, lines=1)
+        n_btn = gr.Button("Post note", variant="primary")
+        n_btn.click(post_note, [n_user, n_text], [notes_md, n_user, n_text])
+        gr.Timer(15).tick(render_notes, outputs=notes_md)   # pick up other users' notes live
 
 
 if __name__ == "__main__":

@@ -68,6 +68,8 @@ def _record(fresh, merge, host, extra=None):
     """Fold one snapshot into `host`'s ring. `merge` True = fast partial (keep prior full-tier
     keys), False = full replace. `extra` (label/tags from a remote payload) is stamped in."""
     errs = fresh.pop("_errors", [])
+    if not isinstance(errs, list):        # semi-trusted remote JSON: a non-list _errors must not
+        errs = [str(errs)]                # crash _record (it's summed with the other tier's list)
     now = time.time()
     with _lock:
         st = _hosts.get(host) or _hosts.setdefault(host, _new_host())

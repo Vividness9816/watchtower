@@ -83,6 +83,8 @@ def diagnose(snap: dict) -> list[dict]:
     # Unpopulated headers legitimately read 0 RPM forever, so judge only the CPU fan(s) —
     # or a total stall (every reported fan at 0).
     cpu_temp = _get(snap, "sensors", "cpu_temp")
+    if not isinstance(cpu_temp, (int, float)) or isinstance(cpu_temp, bool):
+        cpu_temp = None                             # hostile/absent -> don't compare a dict to 90
     fans = _get(snap, "sensors", "fans")
     fans = fans if isinstance(fans, dict) else {}   # remote JSON may send a non-dict; don't crash
     cpu_fans = {k: v for k, v in fans.items()
@@ -96,7 +98,7 @@ def diagnose(snap: dict) -> list[dict]:
     liquid = _get(snap, "sensors", "liquid_temp")
     chk(liquid, "liquid_temp", "coolant temp")
     pump = _get(snap, "sensors", "pump_rpm")
-    if liquid is not None and liquid >= 45 and pump == 0:
+    if isinstance(liquid, (int, float)) and not isinstance(liquid, bool) and liquid >= 45 and pump == 0:
         out.append({"level": "CRIT", "what": "AIO pump (stalled while coolant warm)",
                     "value": 0, "limit": "", "unit": "RPM"})
 

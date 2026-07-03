@@ -10,6 +10,7 @@ ckpt.pt
 *.safetensors
 history.db
 history.log
+notes.db
 # RAG embedding cache — regenerate with `python rag.py --build`
 # (a trailing comment on the pattern line breaks the match: gitignore comments must be whole-line)
 rag_index.db

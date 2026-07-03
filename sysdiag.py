@@ -36,16 +36,28 @@ def snapshot(only=None) -> dict:
     return snap
 
 
+def exit_code_for(findings) -> int:
+    """Machine-consumable severity: 0 = clean, 1 = WARN only, 2 = CRIT present. Lets Task
+    Scheduler / CI / scripts detect machine distress without parsing stdout."""
+    levels = {f.get("level") for f in findings if isinstance(f, dict)}
+    if "CRIT" in levels:
+        return 2
+    if "WARN" in levels:
+        return 1
+    return 0
+
+
 def print_findings(snap):
     import rules
     findings = rules.diagnose(snap)
     if not findings:
         print("OK - no findings. (collectors seen: " + ", ".join(sorted(snap)) + ")")
-        return
+        return findings
     order = {"CRIT": 0, "WARN": 1}
     for f in sorted(findings, key=lambda x: order.get(x["level"], 9)):
         print(f"[{f['level']:4}] {f['what']}: {f['value']}{f['unit']}"
               + (f" (limit {f['limit']}{f['unit']})" if isinstance(f["limit"], (int, float)) else ""))
+    return findings
 
 
 def narrate():
@@ -75,9 +87,20 @@ def main():
     snap = snapshot(only="net" if args.cmd == "net" else None)
     if args.json:
         print(json.dumps(snap, indent=2))
+        return 0
+    import rules
+    findings = rules.diagnose(snap)
+    # reuse print_findings for the human output, then exit with a severity-coded status
+    if not findings:
+        print("OK - no findings. (collectors seen: " + ", ".join(sorted(snap)) + ")")
     else:
-        print_findings(snap)
+        order = {"CRIT": 0, "WARN": 1}
+        for f in sorted(findings, key=lambda x: order.get(x["level"], 9)):
+            print(f"[{f['level']:4}] {f['what']}: {f['value']}{f['unit']}"
+                  + (f" (limit {f['limit']}{f['unit']})" if isinstance(f["limit"], (int, float)) else ""))
+    return exit_code_for(findings)
 
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    _sys.exit(main() or 0)

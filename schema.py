@@ -15,23 +15,40 @@ def _g(snap, *path, default=0):
     return cur
 
 
+def _i(snap, *path):
+    """int() of a dug metric, but SAFE: a hostile non-numeric leaf (list/dict/str from a sick or
+    spoofed remote collector) coerces to 0 instead of raising — summarize()/serialize feed the UI
+    panel and the model, and must never crash on a malformed snapshot. Identical to int(_g(...))
+    for the normal numeric case, so the training corpus is unchanged."""
+    import math
+    v = _g(snap, *path)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return 0
+    if isinstance(v, float) and not math.isfinite(v):     # NaN/inf from a sick collector -> 0
+        return 0
+    return int(v)
+
+
 def serialize_metrics(snap: dict) -> str:
     """The exact INPUT text the model trains and runs on. Keep it stable forever."""
     return "\n".join([
-        f"cpu_load={int(_g(snap,'cpu','load'))} cpu_temp={int(_g(snap,'sensors','cpu_temp'))} "
-        f"mem_pct={int(_g(snap,'mem','pct'))}",
-        f"gpu_util={int(_g(snap,'gpu','util'))} gpu_temp={int(_g(snap,'gpu','temp'))} "
-        f"gpu_power={int(_g(snap,'gpu','power'))} gpu_vram={int(_g(snap,'gpu','vram_pct'))}",
-        f"disk_C={int(_g(snap,'disk','C'))} whea_errors={int(_g(snap,'whea','recent_errors'))}",
+        f"cpu_load={_i(snap,'cpu','load')} cpu_temp={_i(snap,'sensors','cpu_temp')} "
+        f"mem_pct={_i(snap,'mem','pct')}",
+        f"gpu_util={_i(snap,'gpu','util')} gpu_temp={_i(snap,'gpu','temp')} "
+        f"gpu_power={_i(snap,'gpu','power')} gpu_vram={_i(snap,'gpu','vram_pct')}",
+        f"disk_C={_i(snap,'disk','C')} whea_errors={_i(snap,'whea','recent_errors')}",
     ])
 
 
 def summarize(snap: dict) -> str:
     """One-line human summary embedded in every report (training label + runtime)."""
-    return (f"CPU {int(_g(snap,'cpu','load'))}% / {int(_g(snap,'sensors','cpu_temp'))}C, "
-            f"GPU {int(_g(snap,'gpu','util'))}% / {int(_g(snap,'gpu','temp'))}C / "
-            f"{int(_g(snap,'gpu','power'))}W, RAM {int(_g(snap,'mem','pct'))}%, "
-            f"disk C {int(_g(snap,'disk','C'))}%.")
+    return (f"CPU {_i(snap,'cpu','load')}% / {_i(snap,'sensors','cpu_temp')}C, "
+            f"GPU {_i(snap,'gpu','util')}% / {_i(snap,'gpu','temp')}C / "
+            f"{_i(snap,'gpu','power')}W, RAM {_i(snap,'mem','pct')}%, "
+            f"disk C {_i(snap,'disk','C')}%.")
 
 
 def synthetic_snapshot(rng: random.Random) -> dict:
