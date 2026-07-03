@@ -2,6 +2,7 @@
 
 **A local, read-only PC health dashboard with a built-from-scratch GPT and a local LLM chat — no cloud, no API keys, no telemetry.**
 
+![ci](https://github.com/Vividness9816/watchtower/actions/workflows/ci.yml/badge.svg)
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![llm](https://img.shields.io/badge/LLM-Ollama%20qwen2.5%3A32b-green)
@@ -143,6 +144,11 @@ python chat.py       # or the CLI
 Each pure-logic module self-tests: `python schema.py`, `python rules.py`, `python live.py`,
 `python notes.py`, `python search.py`, `python test_security.py`, `python collectors/docker.py
 --test` → `… ok`. `test_security.py` guards the XSS-escape + DoS caps against regression.
+
+**One-shot suite:** `python tests/run_all.py` runs all of the above plus the Linux-parser
+fixture tests and a concurrency stress test (multi-host ingest + shared notes), exiting nonzero
+on any failure — it's the CI entrypoint (`.github/workflows/ci.yml`: a fast no-torch job + a
+CPU-wheel `tests/torch_smoke.py` job). Scanner sweep + triage: [`SECURITY.md`](SECURITY.md).
 
 ---
 
