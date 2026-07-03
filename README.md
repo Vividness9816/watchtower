@@ -141,7 +141,8 @@ python chat.py       # or the CLI
 | `python app.py` | Gradio web dashboard (host selector, graphs, search, notes) |
 
 Each pure-logic module self-tests: `python schema.py`, `python rules.py`, `python live.py`,
-`python notes.py`, `python search.py`, `python collectors/docker.py --test` → `… ok`.
+`python notes.py`, `python search.py`, `python test_security.py`, `python collectors/docker.py
+--test` → `… ok`. `test_security.py` guards the XSS-escape + DoS caps against regression.
 
 ---
 
