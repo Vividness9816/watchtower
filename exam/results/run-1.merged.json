@@ -1,0 +1,28 @@
+{
+ "run": 1,
+ "ts": "2026-07-02T21:37:05",
+ "dims_run": [
+  "s2",
+  "s6"
+ ],
+ "dims_inherited": [
+  "s1",
+  "s3",
+  "s4",
+  "s5",
+  "s7"
+ ],
+ "frozen_ok": true,
+ "scores": {
+  "s1": 0.5063,
+  "s2": 1.0,
+  "s3": 0.9931,
+  "s4": 0.7737,
+  "s5": 1.0,
+  "s6": 0.6923,
+  "s7": 0.2222
+ },
+ "composite": 0.7545,
+ "note": "rules: docker/k3s/vram/commit/free-gb/whea-corrected/tdr/tasks/smart/reboot/ntp/defender + chk numeric-guard",
+ "seconds": 37.0
+}

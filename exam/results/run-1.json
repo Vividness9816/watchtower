@@ -1,0 +1,39 @@
+{
+ "run": 1,
+ "ts": "2026-07-02T21:37:05",
+ "frozen_ok": true,
+ "scores": {
+  "s2": 1.0,
+  "s6": 0.6923
+ },
+ "composite": null,
+ "detail": {
+  "s2": {
+   "passed": 49,
+   "total": 49,
+   "failures": []
+  },
+  "s6_errors": [
+   "tp\\client.py\", line 1450, in getresponse\n    response.begin()\n    ~~~~~~~~~~~~~~^^\n  File \"C:\\Python314\\Lib\\http\\client.py\", line 336, in begin\n    version, status, reason = self._read_status()\n                              ~~~~~~~~~~~~~~~~~^^\n  File \"C:\\Python314\\Lib\\http\\client.py\", line 305, in _read_status\n    raise RemoteDisconnected(\"Remote end closed connection without\"\n                             \" response\")\nhttp.client.RemoteDisconnected: Remote end closed connection without response\n"
+  ],
+  "s6": {
+   "checks": {
+    "schema_demo": true,
+    "rules_demo": true,
+    "live_demo": true,
+    "fast_tier_under_5s": true,
+    "full_fleet_under_30s": true,
+    "full_fleet_low_errors": true,
+    "history_write_hermetic": false,
+    "trends_read_hermetic": true,
+    "ui_render_robust": false,
+    "deltas_correct": true,
+    "exit_code_contract": false,
+    "ingest_loopback": false,
+    "ship_env_precedence": true
+   },
+   "fast_s": 3.87,
+   "full_s": 11.71
+  }
+ }
+}
