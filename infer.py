@@ -10,7 +10,10 @@ from gpt import GPT, GPTConfig, CharTokenizer
 def load(ckpt_path="ckpt.pt", vocab_path="vocab.json", device=None):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     tok = CharTokenizer.load(vocab_path)
-    ck = torch.load(ckpt_path, map_location=device)
+    # weights_only=True: the checkpoint is tensors + a plain config dict, so full-pickle
+    # execution is never needed — and on torch <2.6 (where False was the default) loading a
+    # downloaded ckpt.pt would otherwise be arbitrary code execution.
+    ck = torch.load(ckpt_path, map_location=device, weights_only=True)
     cfg = GPTConfig(**ck["config"])
     model = GPT(cfg).to(device)
     model.load_state_dict(ck["model"])
