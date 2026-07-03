@@ -9,7 +9,9 @@ from gpt import GPT, GPTConfig, CharTokenizer
 
 # ----------------------------------------------------------------- config (tweak me)
 batch_size   = 64
-block_size   = 256
+block_size   = 512     # >= the longest training doc (max 434 chars) so a multi-finding report is
+#                        generated with its INPUT metrics still in the attention window (was 256,
+#                        which truncated ~10% of alert docs mid-report). See RSI run 7.
 max_iters    = 3000
 eval_interval = 250
 eval_iters   = 50

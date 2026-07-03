@@ -175,9 +175,13 @@ with gr.Blocks(title="Watch Tower") as app:
 
 
 if __name__ == "__main__":
+    import os
     art.cli_banner()
+    # port is env-overridable so a second instance (or a remote-monitoring GUI) can run alongside
+    # a local one without editing source; default stays 7860.
+    port = int(os.environ.get("WATCHTOWER_PORT") or os.environ.get("GRADIO_SERVER_PORT") or 7860)
     try:
-        app.launch(server_name="127.0.0.1", server_port=7860, inbrowser=True)
+        app.launch(server_name="127.0.0.1", server_port=port, inbrowser=True)
     finally:
         import subprocess  # free the model's VRAM on clean exit (Ctrl+C / window close)
         subprocess.run(["ollama", "stop", brain.MODEL], check=False)
