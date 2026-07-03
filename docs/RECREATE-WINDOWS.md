@@ -444,6 +444,11 @@ def diagnose(snap: dict) -> list[dict]:
         h = str(d.get("health") or "").strip().lower()
         if h in _BAD_HEALTH:
             out.append({"level": "CRIT", "what": f"drive health ({d.get('name')})", "value": d.get("health"), "limit": "", "unit": ""})
+        # SSD wear (% of rated write endurance consumed) — collected but was never thresholded
+        wear = d.get("wear")
+        if isinstance(wear, (int, float)) and not isinstance(wear, bool) and wear >= 90:
+            out.append({"level": "CRIT" if wear >= 95 else "WARN", "what": f"SSD wear ({d.get('name')})",
+                        "value": wear, "limit": 90, "unit": "%"})
 
     # OS posture: a pending reboot leaves patches half-applied; clock drift breaks logs/certs/auth
     if _get(snap, "os", "pending_reboot") is True:
@@ -452,9 +457,31 @@ def diagnose(snap: dict) -> list[dict]:
     if isinstance(ntp, (int, float)) and not isinstance(ntp, bool) and abs(ntp) >= NTP_OFFSET_MS:
         out.append({"level": "WARN", "what": "system clock drift", "value": int(ntp), "limit": NTP_OFFSET_MS, "unit": "ms"})
 
-    # security posture: real-time AV off is a genuine exposure worth a finding
+    # filesystem corruption (NTFS Event 55) — any occurrence is worth surfacing; and an application-
+    # crash BURST (not the odd one) suggests instability. Both are COLLECTED by events.py but were
+    # never turned into a finding (the data was invisible).
+    ntfs = _get(snap, "events", "ntfs_errors_24h")
+    if isinstance(ntfs, (int, float)) and not isinstance(ntfs, bool) and ntfs >= 1:
+        out.append({"level": "WARN", "what": "NTFS file-system errors (24h)", "value": int(ntfs), "limit": "", "unit": ""})
+    crashes = _get(snap, "events", "app_crashes_24h")
+    if isinstance(crashes, (int, float)) and not isinstance(crashes, bool) and crashes >= 5:
+        out.append({"level": "WARN", "what": "application crashes (24h)", "value": int(crashes), "limit": 5, "unit": ""})
+
+    # security posture: real-time AV off / firewall off are genuine exposures; stale AV signatures
+    # and long-overdue Windows updates mean the box is unprotected against recent threats.
     if _get(snap, "security", "defender_on") is False:
         out.append({"level": "WARN", "what": "Windows Defender real-time protection off", "value": "disabled", "limit": "", "unit": ""})
+    if _get(snap, "security", "firewall_on") is False:
+        out.append({"level": "WARN", "what": "firewall disabled", "value": "off", "limit": "", "unit": ""})
+    sig = _get(snap, "security", "defender_sig_age_days")
+    if isinstance(sig, (int, float)) and not isinstance(sig, bool) and sig >= 7:
+        out.append({"level": "WARN", "what": "Defender signatures stale", "value": int(sig), "limit": 7, "unit": "d"})
+    upd = _get(snap, "os", "win_update_age_days")
+    if isinstance(upd, (int, float)) and not isinstance(upd, bool) and upd >= 60:
+        out.append({"level": "WARN", "what": "Windows updates overdue", "value": int(upd), "limit": 60, "unit": "d"})
+    fl = _get(snap, "security", "failed_logons_24h")
+    if isinstance(fl, (int, float)) and not isinstance(fl, bool) and fl >= 20:
+        out.append({"level": "WARN", "what": "failed logon attempts (24h)", "value": int(fl), "limit": 20, "unit": ""})
 
     # any collector that returned {"error": ...} is itself a (low-sev) finding
     for k, v in snap.items():
@@ -517,6 +544,16 @@ def demo():  # the one runnable check: a hot GPU MUST raise CRIT
     assert not any("reboot" in f["what"] for f in diagnose({"os": {"pending_reboot": None}})), "None reboot must not fire"
     for bad in ("pwn", [1, 2, 3], 5):
         diagnose({"docker": bad}); diagnose({"k3s": bad})     # hostile types must not crash
+    # newly-ruled events/security/wear signals (were collected but invisible)
+    assert any("NTFS" in f["what"] for f in diagnose({"events": {"ntfs_errors_24h": 3}})), "ntfs rule"
+    assert not any("crashes" in f["what"] for f in diagnose({"events": {"app_crashes_24h": 2}})), "crash burst threshold"
+    assert any("crashes" in f["what"] for f in diagnose({"events": {"app_crashes_24h": 9}})), "crash burst rule"
+    assert any("firewall" in f["what"] for f in diagnose({"security": {"firewall_on": False}})), "firewall rule"
+    assert not any("firewall" in f["what"] for f in diagnose({"security": {"firewall_on": True}})), "firewall on = silent"
+    assert any("signatures stale" in f["what"] for f in diagnose({"security": {"defender_sig_age_days": 30}})), "sig-age rule"
+    assert any("updates overdue" in f["what"] for f in diagnose({"os": {"win_update_age_days": 120}})), "update-age rule"
+    assert any(f["level"] == "CRIT" and "SSD wear" in f["what"] for f in diagnose({"storage": {"drives": [{"name": "n", "wear": 97}]}})), "wear rule"
+    assert not any("wear" in f["what"] for f in diagnose({"storage": {"drives": [{"name": "n", "wear": 40}]}})), "healthy wear silent"
     print("rules ok")
 
 
@@ -4497,6 +4534,9 @@ ssh.config.json
 # OS cruft
 Thumbs.db
 .DS_Store
+
+# transient exam dev-run outputs (keep the numbered run-N results)
+exam/results/dev-*.json
 ```
 
 ## 6. Build it — step by step (with expected output)
