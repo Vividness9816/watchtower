@@ -45,3 +45,6 @@ ssh.config.json
 # OS cruft
 Thumbs.db
 .DS_Store
+
+# transient exam dev-run outputs (keep the numbered run-N results)
+exam/results/dev-*.json
