@@ -93,13 +93,19 @@ def main():
         # parse the status string for the states rules.py acts on. Docker writes these verbatim:
         #   "Up 2 hours (unhealthy)", "Restarting (1) 5 seconds ago", "Exited (0) 3 days ago",
         #   "Up 2 hours (Paused)".
+        def _exit_code(s):
+            m = re.search(r"Exited \((\d+)\)", s)
+            return int(m.group(1)) if m else None
         restarting = sum(1 for r in ps if _status(r).startswith("Restarting"))
         unhealthy = sum(1 for r in ps if "(unhealthy)" in _status(r))
         exited = sum(1 for r in ps if _status(r).startswith("Exited"))
+        # a container stopped ON PURPOSE shows "Exited (0)" and is NOT a fault; only a NON-ZERO
+        # exit (crash) is. Split them so the rule fires on crashes, not intentional stops.
+        exited_bad = sum(1 for r in ps if _status(r).startswith("Exited") and (_exit_code(_status(r)) or 0) != 0)
         paused = sum(1 for r in ps if "(Paused)" in _status(r))
         print(json.dumps({"docker": {"daemon_ok": True, "running": running, "total": len(containers),
                                      "restarting": restarting, "unhealthy": unhealthy,
-                                     "exited": exited, "paused": paused,
+                                     "exited": exited, "exited_bad": exited_bad, "paused": paused,
                                      "containers": containers}}))
     except Exception as e:
         print(json.dumps({"docker": {"error": str(e)}}))

@@ -396,9 +396,12 @@ def diagnose(snap: dict) -> list[dict]:
         unhealthy = docker.get("unhealthy")
         if isinstance(unhealthy, (int, float)) and not isinstance(unhealthy, bool) and unhealthy >= 1:
             out.append({"level": "WARN", "what": "docker containers unhealthy", "value": int(unhealthy), "limit": "", "unit": ""})
-        exited = docker.get("exited")
-        if isinstance(exited, (int, float)) and not isinstance(exited, bool) and exited >= 1:
-            out.append({"level": "WARN", "what": "docker containers exited", "value": int(exited), "limit": "", "unit": ""})
+        # only NON-ZERO exits (crashes) are a finding — a container you stopped on purpose
+        # ("Exited (0)") is not a fault. Read exited_bad specifically (not the total `exited`,
+        # which counts clean stops); absent on a legacy agent -> no finding, which is correct.
+        exited_bad = docker.get("exited_bad")
+        if isinstance(exited_bad, (int, float)) and not isinstance(exited_bad, bool) and exited_bad >= 1:
+            out.append({"level": "WARN", "what": "docker containers crashed", "value": int(exited_bad), "limit": "", "unit": ""})
 
     # k3s: phase='Running' hides CrashLoopBackOff and not-ready containers — judge those explicitly
     k3s = _get(snap, "k3s")
@@ -427,10 +430,20 @@ def diagnose(snap: dict) -> list[dict]:
         names = ", ".join(str(t) for t in tasks[:5])
         out.append({"level": "WARN", "what": "scheduled task failures", "value": names, "limit": "", "unit": ""})
 
-    # SMART critical-warning flag on any physical drive -> imminent failure
+    # drive health -> imminent failure. Two signals: an explicit SMART critical-warning flag
+    # (smartctl exposes it on Linux), OR the collected HealthStatus (Get-PhysicalDisk on Windows,
+    # smartctl on Linux) reading a bad value. The original rule only checked smart_critical_warning,
+    # which the Windows/Linux storage collectors never emit -> it was dead. `health` is what they
+    # actually report, so judge that too (allow-list of BAD values so an "Unknown"/null never fires).
+    _BAD_HEALTH = {"warning", "unhealthy", "failed", "bad", "caution", "degraded", "pred fail"}
     for d in _get(snap, "storage", "drives") or []:
-        if isinstance(d, dict) and d.get("smart_critical_warning") is True:
+        if not isinstance(d, dict):
+            continue
+        if d.get("smart_critical_warning") is True:
             out.append({"level": "CRIT", "what": f"SMART critical warning ({d.get('name')})", "value": "set", "limit": "", "unit": ""})
+        h = str(d.get("health") or "").strip().lower()
+        if h in _BAD_HEALTH:
+            out.append({"level": "CRIT", "what": f"drive health ({d.get('name')})", "value": d.get("health"), "limit": "", "unit": ""})
 
     # OS posture: a pending reboot leaves patches half-applied; clock drift breaks logs/certs/auth
     if _get(snap, "os", "pending_reboot") is True:
@@ -1461,13 +1474,19 @@ def main():
         # parse the status string for the states rules.py acts on. Docker writes these verbatim:
         #   "Up 2 hours (unhealthy)", "Restarting (1) 5 seconds ago", "Exited (0) 3 days ago",
         #   "Up 2 hours (Paused)".
+        def _exit_code(s):
+            m = re.search(r"Exited \((\d+)\)", s)
+            return int(m.group(1)) if m else None
         restarting = sum(1 for r in ps if _status(r).startswith("Restarting"))
         unhealthy = sum(1 for r in ps if "(unhealthy)" in _status(r))
         exited = sum(1 for r in ps if _status(r).startswith("Exited"))
+        # a container stopped ON PURPOSE shows "Exited (0)" and is NOT a fault; only a NON-ZERO
+        # exit (crash) is. Split them so the rule fires on crashes, not intentional stops.
+        exited_bad = sum(1 for r in ps if _status(r).startswith("Exited") and (_exit_code(_status(r)) or 0) != 0)
         paused = sum(1 for r in ps if "(Paused)" in _status(r))
         print(json.dumps({"docker": {"daemon_ok": True, "running": running, "total": len(containers),
                                      "restarting": restarting, "unhealthy": unhealthy,
-                                     "exited": exited, "paused": paused,
+                                     "exited": exited, "exited_bad": exited_bad, "paused": paused,
                                      "containers": containers}}))
     except Exception as e:
         print(json.dumps({"docker": {"error": str(e)}}))
@@ -2610,14 +2629,18 @@ def search(component=None, host=None, since=None, until=None, limit=2000):
     if component is not None:
         component = str(component)[:200]      # cap: a metric path is short; a huge string would
         #                                       turn the per-row substring scan into a DoS
-    where, params = [], []
-    if host is not None:
-        where.append("host = ?"); params.append(host)
+    # keep the time bounds separate from the host bound: a pre-host-column DB must still honor
+    # since/until (the fallback below drops ONLY the host clause, never the time window).
+    ts_where, ts_params = [], []
     if since is not None:
-        where.append("ts >= ?"); params.append(since)
+        ts_where.append("ts >= ?"); ts_params.append(since)
     if until is not None:
-        where.append("ts <= ?"); params.append(until)
+        ts_where.append("ts <= ?"); ts_params.append(until)
+    where, params = list(ts_where), list(ts_params)
+    if host is not None:
+        where.insert(0, "host = ?"); params.insert(0, host)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
+    ts_clause = (" WHERE " + " AND ".join(ts_where)) if ts_where else ""
     comp = component.lower() if component else None
     out = []
     with sqlite3.connect(DB) as con:
@@ -2625,8 +2648,10 @@ def search(component=None, host=None, since=None, until=None, limit=2000):
             rows = con.execute(f"SELECT ts, host, json FROM snapshots{clause} ORDER BY ts DESC",
                                params).fetchall()
         except sqlite3.OperationalError:
-            # pre-host DB (no host column): re-query without host filtering, tag rows as unknown
-            rows = con.execute("SELECT ts, json FROM snapshots ORDER BY ts DESC").fetchall()
+            # pre-host DB (no host column): drop ONLY the host filter, keep the time window;
+            # the host filter is then re-applied per-row from the snapshot's own _host below.
+            rows = con.execute(f"SELECT ts, json FROM snapshots{ts_clause} ORDER BY ts DESC",
+                               ts_params).fetchall()
             rows = [(ts, None, j) for ts, j in rows]
     for row in rows:
         ts, h, j = row

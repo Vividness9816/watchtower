@@ -209,9 +209,12 @@ def diagnose(snap: dict) -> list[dict]:
         unhealthy = docker.get("unhealthy")
         if isinstance(unhealthy, (int, float)) and not isinstance(unhealthy, bool) and unhealthy >= 1:
             out.append({"level": "WARN", "what": "docker containers unhealthy", "value": int(unhealthy), "limit": "", "unit": ""})
-        exited = docker.get("exited")
-        if isinstance(exited, (int, float)) and not isinstance(exited, bool) and exited >= 1:
-            out.append({"level": "WARN", "what": "docker containers exited", "value": int(exited), "limit": "", "unit": ""})
+        # only NON-ZERO exits (crashes) are a finding — a container you stopped on purpose
+        # ("Exited (0)") is not a fault. Read exited_bad specifically (not the total `exited`,
+        # which counts clean stops); absent on a legacy agent -> no finding, which is correct.
+        exited_bad = docker.get("exited_bad")
+        if isinstance(exited_bad, (int, float)) and not isinstance(exited_bad, bool) and exited_bad >= 1:
+            out.append({"level": "WARN", "what": "docker containers crashed", "value": int(exited_bad), "limit": "", "unit": ""})
 
     # k3s: phase='Running' hides CrashLoopBackOff and not-ready containers — judge those explicitly
     k3s = _get(snap, "k3s")
@@ -240,10 +243,20 @@ def diagnose(snap: dict) -> list[dict]:
         names = ", ".join(str(t) for t in tasks[:5])
         out.append({"level": "WARN", "what": "scheduled task failures", "value": names, "limit": "", "unit": ""})
 
-    # SMART critical-warning flag on any physical drive -> imminent failure
+    # drive health -> imminent failure. Two signals: an explicit SMART critical-warning flag
+    # (smartctl exposes it on Linux), OR the collected HealthStatus (Get-PhysicalDisk on Windows,
+    # smartctl on Linux) reading a bad value. The original rule only checked smart_critical_warning,
+    # which the Windows/Linux storage collectors never emit -> it was dead. `health` is what they
+    # actually report, so judge that too (allow-list of BAD values so an "Unknown"/null never fires).
+    _BAD_HEALTH = {"warning", "unhealthy", "failed", "bad", "caution", "degraded", "pred fail"}
     for d in _get(snap, "storage", "drives") or []:
-        if isinstance(d, dict) and d.get("smart_critical_warning") is True:
+        if not isinstance(d, dict):
+            continue
+        if d.get("smart_critical_warning") is True:
             out.append({"level": "CRIT", "what": f"SMART critical warning ({d.get('name')})", "value": "set", "limit": "", "unit": ""})
+        h = str(d.get("health") or "").strip().lower()
+        if h in _BAD_HEALTH:
+            out.append({"level": "CRIT", "what": f"drive health ({d.get('name')})", "value": d.get("health"), "limit": "", "unit": ""})
 
     # OS posture: a pending reboot leaves patches half-applied; clock drift breaks logs/certs/auth
     if _get(snap, "os", "pending_reboot") is True:

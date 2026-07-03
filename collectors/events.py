@@ -12,10 +12,17 @@ $since1 = (Get-Date).AddDays(-1)
 try { $out.gpu_tdr_7d = [int]((Get-WinEvent -FilterHashtable @{LogName='System';Id=4101;StartTime=$since} -EA SilentlyContinue | Measure-Object).Count) } catch { $out.gpu_tdr_7d = 0 }
 try { $out.app_crashes_24h = [int]((Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='Application Error';Id=1000;StartTime=$since1} -EA SilentlyContinue | Measure-Object).Count) } catch { $out.app_crashes_24h = 0 }
 try { $out.ntfs_errors_24h = [int]((Get-WinEvent -FilterHashtable @{LogName='System';Id=55;StartTime=$since1} -EA SilentlyContinue | Measure-Object).Count) } catch { $out.ntfs_errors_24h = 0 }
-try { $f = Get-ScheduledTask -EA Stop | Get-ScheduledTaskInfo -EA SilentlyContinue |
-        Where-Object { $_.LastTaskResult -ne 0 -and $_.LastTaskResult -ne 267009 -and $_.LastRunTime -gt $since } |
-        Select-Object -ExpandProperty TaskName -First 10
-      $out.task_failures = @($f) } catch { $out.task_failures = @() }
+try {
+  # Windows' OWN maintenance tasks (\Microsoft\*) routinely report non-zero results benignly, and
+  # several result codes mean "running / not-yet-run / disabled / terminated-by-user" not "failed".
+  # Exclude both so this surfaces a task the OPERATOR set up that is genuinely failing, not OS noise.
+  $benign = @(0, 1, 267009, 267010, 267011, 267012, 267014)
+  $f = Get-ScheduledTask -EA Stop |
+       Where-Object { $_.TaskPath -notlike '\Microsoft\*' } |
+       ForEach-Object { $ti = $_ | Get-ScheduledTaskInfo -EA SilentlyContinue
+         if ($ti -and ($benign -notcontains $ti.LastTaskResult) -and $ti.LastRunTime -gt $since) { $_.TaskName } } |
+       Select-Object -First 10
+  $out.task_failures = @($f) } catch { $out.task_failures = @() }
 [pscustomobject]$out | ConvertTo-Json -Compress
 """
 

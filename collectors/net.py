@@ -4,10 +4,15 @@
 import json, subprocess, re, platform, socket, time, threading
 
 
-def ping(host="1.1.1.1"):
+def ping(host="1.1.1.1", timeout=5):
     n = "-n" if platform.system() == "Windows" else "-c"
+    # bound the ICMP wait itself (-w ms on Windows, -W s on Linux) so a dead host returns fast —
+    # the gateway ping runs AFTER the concurrent probes join, so it must not add ~5s and risk
+    # tripping sysdiag's 25s collector kill.
+    w = ["-w", str(timeout * 1000)] if platform.system() == "Windows" else ["-W", str(timeout)]
     try:
-        out = subprocess.run(["ping", n, "1", host], capture_output=True, text=True, timeout=5).stdout
+        out = subprocess.run(["ping", n, "1", *w, host], capture_output=True, text=True,
+                             timeout=timeout + 1).stdout
         m = re.search(r"time[=<]\s*(\d+)\s*ms", out)   # "time=12ms" / "time<1ms"
         return int(m.group(1)) if m else None
     except Exception:
@@ -73,7 +78,9 @@ for t in probes:
 dns_cold, dns_warm = r.get("dns") or (None, None)
 lk = r.get("lk") or {}
 gw = lk.get("Gateway")
-gw_ms = ping(gw) if gw else None       # localize a fault: gateway up but WAN down = ISP problem
+gw_ms = ping(gw, timeout=2) if gw else None   # localize a fault: gateway up but WAN down = ISP
+#                                               problem. 2s cap: this runs after the join, so it
+#                                               must stay well under the remaining 25s budget.
 print(json.dumps({"net": {"ping_ms": r.get("ping"), "target": "1.1.1.1",
                           "gateway_ms": gw_ms, "gateway": gw, "dns_server": (lk.get("Dns") or None),
                           "dns_ms": dns_warm, "dns_cold_ms": dns_cold,

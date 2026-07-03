@@ -34,14 +34,18 @@ def search(component=None, host=None, since=None, until=None, limit=2000):
     if component is not None:
         component = str(component)[:200]      # cap: a metric path is short; a huge string would
         #                                       turn the per-row substring scan into a DoS
-    where, params = [], []
-    if host is not None:
-        where.append("host = ?"); params.append(host)
+    # keep the time bounds separate from the host bound: a pre-host-column DB must still honor
+    # since/until (the fallback below drops ONLY the host clause, never the time window).
+    ts_where, ts_params = [], []
     if since is not None:
-        where.append("ts >= ?"); params.append(since)
+        ts_where.append("ts >= ?"); ts_params.append(since)
     if until is not None:
-        where.append("ts <= ?"); params.append(until)
+        ts_where.append("ts <= ?"); ts_params.append(until)
+    where, params = list(ts_where), list(ts_params)
+    if host is not None:
+        where.insert(0, "host = ?"); params.insert(0, host)
     clause = (" WHERE " + " AND ".join(where)) if where else ""
+    ts_clause = (" WHERE " + " AND ".join(ts_where)) if ts_where else ""
     comp = component.lower() if component else None
     out = []
     with sqlite3.connect(DB) as con:
@@ -49,8 +53,10 @@ def search(component=None, host=None, since=None, until=None, limit=2000):
             rows = con.execute(f"SELECT ts, host, json FROM snapshots{clause} ORDER BY ts DESC",
                                params).fetchall()
         except sqlite3.OperationalError:
-            # pre-host DB (no host column): re-query without host filtering, tag rows as unknown
-            rows = con.execute("SELECT ts, json FROM snapshots ORDER BY ts DESC").fetchall()
+            # pre-host DB (no host column): drop ONLY the host filter, keep the time window;
+            # the host filter is then re-applied per-row from the snapshot's own _host below.
+            rows = con.execute(f"SELECT ts, json FROM snapshots{ts_clause} ORDER BY ts DESC",
+                               ts_params).fetchall()
             rows = [(ts, None, j) for ts, j in rows]
     for row in rows:
         ts, h, j = row
