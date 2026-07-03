@@ -15,11 +15,28 @@ def main():
             print(json.dumps({"k3s": {"error": (r.stderr or "kubectl failed").strip()[:200]}}))
             return
         items = json.loads(r.stdout).get("items", [])
-        pods = [{"name": i.get("metadata", {}).get("name"),
-                 "namespace": i.get("metadata", {}).get("namespace"),
-                 "phase": i.get("status", {}).get("phase")} for i in items]
+        pods = []
+        crashloop = not_ready = 0
+        for i in items:
+            st = i.get("status", {}) or {}
+            cs = st.get("containerStatuses") or []
+            # phase stays 'Running' through a CrashLoopBackOff (k8s semantics), so judge the
+            # container states directly, not just the pod phase.
+            waiting = [c.get("state", {}).get("waiting", {}).get("reason")
+                       for c in cs if isinstance(c, dict)]
+            pod_crashloop = any(w == "CrashLoopBackOff" for w in waiting)
+            pod_notready = bool(cs) and any(not c.get("ready", False) for c in cs
+                                            if isinstance(c, dict)) and st.get("phase") == "Running"
+            restarts = sum(int(c.get("restartCount") or 0) for c in cs if isinstance(c, dict))
+            crashloop += pod_crashloop
+            not_ready += pod_notready and not pod_crashloop
+            pods.append({"name": i.get("metadata", {}).get("name"),
+                         "namespace": i.get("metadata", {}).get("namespace"),
+                         "phase": st.get("phase"), "restarts": restarts,
+                         "crashloop": pod_crashloop})
         running = sum(1 for p in pods if p["phase"] == "Running")
-        print(json.dumps({"k3s": {"running": running, "total": len(pods), "pods": pods}}))
+        print(json.dumps({"k3s": {"running": running, "total": len(pods),
+                                  "crashloop": crashloop, "not_ready": not_ready, "pods": pods}}))
     except Exception as e:
         print(json.dumps({"k3s": {"error": str(e)}}))
 

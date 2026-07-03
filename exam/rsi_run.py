@@ -17,16 +17,21 @@ ALL = list(W)
 
 
 def latest_merged(before_run):
-    """Most recent run-<k>.merged.json (or run-0.json) with k < before_run, for inheritance."""
-    best, best_k = None, -1
+    """Most recent FULL run with k < before_run, for inheritance. Prefers run-<k>.merged.json
+    (written here, all dims populated) over the partial run-<k>.json that run_exam writes."""
+    best, best_k, best_merged = None, -1, False
     for p in RES.glob("run-*.json"):
+        is_merged = p.name.endswith(".merged.json")
         stem = p.stem.replace(".merged", "")
         try:
             k = int(stem.split("-")[1])
         except (IndexError, ValueError):
             continue
-        if k < before_run and k > best_k:
-            best, best_k = p, k
+        if k >= before_run:
+            continue
+        # higher run wins; at the same run, the .merged file wins over the partial
+        if k > best_k or (k == best_k and is_merged and not best_merged):
+            best, best_k, best_merged = p, k, is_merged
     return json.loads(best.read_text(encoding="utf-8")) if best else None
 
 

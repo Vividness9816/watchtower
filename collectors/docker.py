@@ -43,8 +43,12 @@ def _int(s):
 
 
 def _run(args):
-    out = subprocess.run([DOCKER, *args], capture_output=True, text=True, timeout=30).stdout.strip()
-    return [json.loads(line) for line in out.splitlines() if line.strip()]
+    # raise on a nonzero exit so a DOWN daemon (empty stdout, error on stderr) is distinguishable
+    # from a genuinely empty result — otherwise "daemon unreachable" reads as "zero containers".
+    r = subprocess.run([DOCKER, *args], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "docker command failed").strip()[:200])
+    return [json.loads(line) for line in r.stdout.strip().splitlines() if line.strip()]
 
 
 def main():
@@ -52,7 +56,12 @@ def main():
         print(json.dumps({"docker": {"error": "docker.exe not found (is Docker Desktop installed?)"}}))
         return
     try:
-        ps = _run(["ps", "--all", "--format", "{{json .}}"])
+        try:
+            ps = _run(["ps", "--all", "--format", "{{json .}}"])
+        except Exception as e:
+            # daemon down / unreachable — an explicit state, NOT zero containers
+            print(json.dumps({"docker": {"daemon_ok": False, "error": str(e)[:200]}}))
+            return
         try:
             stats = {s.get("Name"): s for s in _run(["stats", "--no-stream", "--format", "{{json .}}"])}
         except Exception:
@@ -78,8 +87,19 @@ def main():
                 "blk_write_bytes": blk_w,
                 "pids": _int(st.get("PIDs")),
             })
-        running = sum(1 for r in ps if str(r.get("Status", "")).startswith("Up"))
-        print(json.dumps({"docker": {"running": running, "total": len(containers),
+        def _status(r):
+            return str(r.get("Status", ""))
+        running = sum(1 for r in ps if _status(r).startswith("Up"))
+        # parse the status string for the states rules.py acts on. Docker writes these verbatim:
+        #   "Up 2 hours (unhealthy)", "Restarting (1) 5 seconds ago", "Exited (0) 3 days ago",
+        #   "Up 2 hours (Paused)".
+        restarting = sum(1 for r in ps if _status(r).startswith("Restarting"))
+        unhealthy = sum(1 for r in ps if "(unhealthy)" in _status(r))
+        exited = sum(1 for r in ps if _status(r).startswith("Exited"))
+        paused = sum(1 for r in ps if "(Paused)" in _status(r))
+        print(json.dumps({"docker": {"daemon_ok": True, "running": running, "total": len(containers),
+                                     "restarting": restarting, "unhealthy": unhealthy,
+                                     "exited": exited, "paused": paused,
                                      "containers": containers}}))
     except Exception as e:
         print(json.dumps({"docker": {"error": str(e)}}))

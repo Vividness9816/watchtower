@@ -45,10 +45,16 @@ try:
         except Exception:
             continue
     vram = round(100 * num(used) / num(total)) if num(used) is not None and num(total) else None
+    driver = None
+    try:
+        driver = q("driver_version")[0] or None
+    except Exception:
+        pass
     print(json.dumps({"gpu": {
         "util": i(u), "temp": i(t), "power": i(p), "vram_pct": vram,
+        "vram_used_mb": i(used), "vram_total_mb": i(total),
         "fan_pct": i(fan), "pstate": pstate, "sm_mhz": i(sm), "sm_max_mhz": i(smmax),
-        "power_limit": i(plim), "throttle": reasons,
+        "power_limit": i(plim), "throttle": reasons, "driver": driver,
         "pcie": {"gen": i(gen), "gen_max": i(genmax), "width": i(w), "width_max": i(wmax)},
     }}))
 except FileNotFoundError:

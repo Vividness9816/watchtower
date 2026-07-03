@@ -43,7 +43,11 @@ def dns_pair():
 def link():
     ps = (r"$a=Get-NetAdapter -Physical | Where-Object Status -eq 'Up' | Select-Object -First 1;"
           r"$s=$a | Get-NetAdapterStatistics -EA SilentlyContinue;"
-          r"[pscustomobject]@{Name=$a.Name;LinkSpeed=$a.LinkSpeed;"
+          r"$gw=(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -EA SilentlyContinue | "
+          r"Sort-Object RouteMetric | Select-Object -First 1).NextHop;"
+          r"$dns=(Get-DnsClientServerAddress -AddressFamily IPv4 -EA SilentlyContinue | "
+          r"Where-Object ServerAddresses | Select-Object -First 1 -ExpandProperty ServerAddresses);"
+          r"[pscustomobject]@{Name=$a.Name;LinkSpeed=$a.LinkSpeed;Gateway=$gw;Dns=($dns -join ',');"
           r"RxErr=$s.ReceivedPacketErrors;TxErr=$s.OutboundPacketErrors;"
           r"RxDisc=$s.ReceivedDiscardedPackets;TxDisc=$s.OutboundDiscardedPackets}"
           r"|ConvertTo-Json -Compress")
@@ -55,8 +59,9 @@ def link():
         return None
 
 
-# run the three probes CONCURRENTLY so worst case is max(dns 19, link 10, ping 5) ~= 19s,
-# safely under sysdiag's 25s kill switch even with the resolver fully dead
+# run the probes CONCURRENTLY so worst case is max(dns 19, link 10, ping 5) ~= 19s,
+# safely under sysdiag's 25s kill switch even with the resolver fully dead. The gateway ping
+# needs the link probe's NextHop first, so it runs after link resolves (still inside the budget).
 r = {}
 probes = [threading.Thread(target=lambda: r.__setitem__("dns", dns_pair()), daemon=True),
           threading.Thread(target=lambda: r.__setitem__("lk", link()), daemon=True),
@@ -67,7 +72,10 @@ for t in probes:
     t.join(21)
 dns_cold, dns_warm = r.get("dns") or (None, None)
 lk = r.get("lk") or {}
+gw = lk.get("Gateway")
+gw_ms = ping(gw) if gw else None       # localize a fault: gateway up but WAN down = ISP problem
 print(json.dumps({"net": {"ping_ms": r.get("ping"), "target": "1.1.1.1",
+                          "gateway_ms": gw_ms, "gateway": gw, "dns_server": (lk.get("Dns") or None),
                           "dns_ms": dns_warm, "dns_cold_ms": dns_cold,
                           "up": bool(lk.get("Name")), "name": lk.get("Name"),
                           "speed": lk.get("LinkSpeed"),
