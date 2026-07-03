@@ -7,13 +7,18 @@
 import json, subprocess
 
 # Level: 1=Critical 2=Error 3=Warning. Uncorrected hardware errors log at 1/2; corrected at 3.
-ps = (r"$since=(Get-Date).AddDays(-7);"
+# The Message field is MUI-localized text and PS 5.1 emits it in the console OEM codepage when
+# redirected — force UTF-8 on both sides of the pipe or a German/Russian event byte kills the
+# whole payload with a decode error exactly when WHEA events exist.
+ps = (r"[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+      r"$since=(Get-Date).AddDays(-7);"
       r"$e=Get-WinEvent -FilterHashtable @{LogName='System';"
       r"ProviderName='Microsoft-Windows-WHEA-Logger';StartTime=$since} -MaxEvents 200 -ErrorAction SilentlyContinue;"
       r"$e | Select-Object TimeCreated,Id,Level,Message | ConvertTo-Json -Compress")
 try:
     out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True, timeout=20).stdout.strip()
+                         capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         timeout=20).stdout.strip()
     events = json.loads(out) if out else []
     if isinstance(events, dict):
         events = [events]

@@ -1042,12 +1042,33 @@ ps = (r"$c=Get-CimInstance Win32_Processor;"
       r"$load=if($null -ne $l){[math]::Min(100,[int]$l)}else{$null};"
       r"$perf=(Get-Counter '\Processor Information(_Total)\% Processor Performance' "
       r"-EA SilentlyContinue).CounterSamples.CookedValue;"
+      # locale-safe fallback: counter NAMES are localized on non-English Windows, but the
+      # Perflib registry maps language-neutral counter INDICES (the '009' list is English on
+      # EVERY locale) to the current language's names — build the localized path and retry,
+      # else honest null. (Win32_PerfFormattedData_* CIM is NOT viable here: recent Win11
+      # builds ship with no ADAP-populated perf classes — 'Invalid class' on this machine.)
+      r"$lo=$null;$lc=$null;"
+      r"if($null -eq $perf){"
+      r"$e=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib\009'"
+      r" -EA SilentlyContinue).Counter;"
+      r"$n=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib\CurrentLanguage'"
+      r" -EA SilentlyContinue).Counter;"
+      r"$io=$null;$ic=$null;for($i=0;$i -lt $e.Count-1;$i+=2){"
+      r"if($e[$i+1] -ceq 'Processor Information'){$io=$e[$i]};"
+      r"if($e[$i+1] -ceq '% Processor Performance'){$ic=$e[$i]}};"
+      r"if($io -and $ic){for($i=0;$i -lt $n.Count-1;$i+=2){"
+      r"if($n[$i] -eq $io){$lo=$n[$i+1]};if($n[$i] -eq $ic){$lc=$n[$i+1]}}};"
+      r"if($lo -and $lc){$perf=(Get-Counter ('\'+$lo+'(_Total)\'+$lc)"
+      r" -EA SilentlyContinue).CounterSamples.CookedValue}};"
       r"$max=($c.MaxClockSpeed|Measure-Object -Maximum).Maximum;"
       r"$cur=if($perf){[int]($max*$perf/100)}else{$null};"
       # per-core % Processor Performance -> the fastest single core right now (hybrid P-cores
       # boost well past the fleet average, which sits below base under mixed load)
       r"$pc=(Get-Counter '\Processor Information(*)\% Processor Performance' -EA SilentlyContinue)."
       r"CounterSamples|Where-Object{$_.InstanceName -notmatch '_Total'};"
+      # same localized-name gap as $perf — reuse the translated path when we had to build one
+      r"if($null -eq $pc -and $lo -and $lc){$pc=(Get-Counter ('\'+$lo+'(*)\'+$lc)"
+      r" -EA SilentlyContinue).CounterSamples|Where-Object{$_.InstanceName -notmatch '_Total'}};"
       r"$pk=if($pc){($pc.CookedValue|Measure-Object -Maximum).Maximum}else{$null};"
       r"$maxcore=if($pk){[int]($max*$pk/100)}else{$null};"
       r"[pscustomobject]@{cores=($c.NumberOfCores|Measure-Object -Sum).Sum;"
@@ -1300,14 +1321,26 @@ import json, subprocess, re, platform, socket, time, threading
 
 
 def ping(host="1.1.1.1", timeout=5):
-    n = "-n" if platform.system() == "Windows" else "-c"
-    # bound the ICMP wait itself (-w ms on Windows, -W s on Linux) so a dead host returns fast —
-    # the gateway ping runs AFTER the concurrent probes join, so it must not add ~5s and risk
-    # tripping sysdiag's 25s collector kill.
-    w = ["-w", str(timeout * 1000)] if platform.system() == "Windows" else ["-W", str(timeout)]
+    if platform.system() == "Windows":
+        # ping.exe's reply text is MUI-localized ("Zeit=12ms" / "время=12мс") so parsing it dies
+        # on non-English Windows; CIM Win32_PingStatus returns numeric StatusCode/ResponseTime on
+        # every locale. Keep the subprocess cap at timeout+1 so the post-join gateway call keeps
+        # the original 24s worst case under sysdiag's 25s kill — the only calls the tight cap can
+        # kill are dead-host ones whose correct answer is None anyway.
+        ps = (f"Get-CimInstance Win32_PingStatus -Filter \"Address='{host}' AND Timeout={timeout * 1000}\" "
+              "-EA SilentlyContinue | Select-Object StatusCode,ResponseTime | ConvertTo-Json -Compress")
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=timeout + 1).stdout.strip()
+            d = json.loads(out) if out else {}
+            # ping.exe reports sub-ms as "time<1ms" -> the old regex returned 1; max(1, rt) keeps
+            # the output identical (ResponseTime=0 means <1ms), and 0 would be falsy downstream.
+            return max(1, int(d.get("ResponseTime") or 0)) if d.get("StatusCode") == 0 else None
+        except Exception:
+            return None
     try:
-        out = subprocess.run(["ping", n, "1", *w, host], capture_output=True, text=True,
-                             timeout=timeout + 1).stdout
+        out = subprocess.run(["ping", "-c", "1", "-W", str(timeout), host],
+                             capture_output=True, text=True, timeout=timeout + 1).stdout
         m = re.search(r"time[=<]\s*(\d+)\s*ms", out)   # "time=12ms" / "time<1ms"
         return int(m.group(1)) if m else None
     except Exception:
@@ -1582,13 +1615,18 @@ Windows hardware-error channel — 7-day-WINDOWED uncorrected count + corrected-
 import json, subprocess
 
 # Level: 1=Critical 2=Error 3=Warning. Uncorrected hardware errors log at 1/2; corrected at 3.
-ps = (r"$since=(Get-Date).AddDays(-7);"
+# The Message field is MUI-localized text and PS 5.1 emits it in the console OEM codepage when
+# redirected — force UTF-8 on both sides of the pipe or a German/Russian event byte kills the
+# whole payload with a decode error exactly when WHEA events exist.
+ps = (r"[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+      r"$since=(Get-Date).AddDays(-7);"
       r"$e=Get-WinEvent -FilterHashtable @{LogName='System';"
       r"ProviderName='Microsoft-Windows-WHEA-Logger';StartTime=$since} -MaxEvents 200 -ErrorAction SilentlyContinue;"
       r"$e | Select-Object TimeCreated,Id,Level,Message | ConvertTo-Json -Compress")
 try:
     out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True, timeout=20).stdout.strip()
+                         capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         timeout=20).stdout.strip()
     events = json.loads(out) if out else []
     if isinstance(events, dict):
         events = [events]
@@ -1643,6 +1681,20 @@ def _from_gettpm():
     return d if d.get("present") is not None else None
 
 
+def _from_pnp():
+    # last-resort, locale-safe AND unelevated: tpmtool's console labels are MUI-localized (its
+    # English-label regexes above match nothing on a German/Japanese box) and Get-Tpm is blank
+    # unelevated — but device instance IDs are never localized, and every TPM 2.0 enumerates
+    # as ACPI device MSFT0101. TPM 1.2 (PNP0C31) stays None -> the honest error, not a false no.
+    ps = ("$p=@(Get-CimInstance Win32_PnPEntity -Filter \"PNPDeviceID LIKE '%MSFT0101%'\").Count -gt 0;"
+          "[pscustomobject]@{present=$p;version=$(if($p){'2.0'}else{$null});manufacturer=$null;ready=$null}"
+          "|ConvertTo-Json -Compress")
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, timeout=15).stdout.strip()
+    d = json.loads(out) if out else {}
+    return d if d.get("present") else None
+
+
 def main():
     try:
         d = _from_tpmtool()
@@ -1651,6 +1703,11 @@ def main():
     if d is None:
         try:
             d = _from_gettpm()
+        except Exception:
+            d = None
+    if d is None:
+        try:
+            d = _from_pnp()
         except Exception:
             d = None
     if d is None:
@@ -1907,7 +1964,11 @@ Top CPU / RAM / per-process GPU-VRAM consumers (names the chat model's own footp
 # is cross-platform where nvidia-smi exists.
 import json, platform, shutil, subprocess
 
+# process names are environment data (can be non-ASCII); PS 5.1 emits them in the console OEM
+# codepage when redirected — force UTF-8 on both sides of the pipe or one umlauted exe name
+# kills the whole top_cpu/top_mem payload with a decode error.
 PS = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $out = [ordered]@{}
 try {
   $n = [math]::Max(1,(Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors)
@@ -1957,7 +2018,8 @@ def main():
     if platform.system() == "Windows":
         try:
             out = subprocess.run(["powershell", "-NoProfile", "-Command", PS],
-                                 capture_output=True, text=True, timeout=20).stdout.strip()
+                                 capture_output=True, text=True, encoding="utf-8",
+                                 errors="replace", timeout=20).stdout.strip()
             d = json.loads(out) if out else {}
             if isinstance(d, dict):
                 data.update(d)
@@ -2126,7 +2188,10 @@ import json, subprocess
 
 # Get-VM may be missing entirely (Hyper-V role not installed) -> the whole block throws and
 # we degrade. Per VM we pull state + the three encryption-relevant security flags.
+# VM names are operator text (can be non-ASCII); PS 5.1 emits them in the console OEM codepage
+# when redirected — force UTF-8 on both sides of the pipe or one accented name kills the payload.
 ps = (
+    r"[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
     r"if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) { '[]'; exit }"
     r"$vms = Get-VM | ForEach-Object {"
     r"  $s = $null; try { $s = Get-VMSecurity -VMName $_.Name -ErrorAction SilentlyContinue } catch {}"
@@ -2142,7 +2207,8 @@ ps = (
 )
 try:
     out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True, timeout=20).stdout.strip()
+                         capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         timeout=20).stdout.strip()
     vms = json.loads(out) if out and out != "[]" else []
     if isinstance(vms, dict):
         vms = [vms]

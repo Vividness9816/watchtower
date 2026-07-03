@@ -5,7 +5,11 @@
 # is cross-platform where nvidia-smi exists.
 import json, platform, shutil, subprocess
 
+# process names are environment data (can be non-ASCII); PS 5.1 emits them in the console OEM
+# codepage when redirected — force UTF-8 on both sides of the pipe or one umlauted exe name
+# kills the whole top_cpu/top_mem payload with a decode error.
 PS = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $out = [ordered]@{}
 try {
   $n = [math]::Max(1,(Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors)
@@ -55,7 +59,8 @@ def main():
     if platform.system() == "Windows":
         try:
             out = subprocess.run(["powershell", "-NoProfile", "-Command", PS],
-                                 capture_output=True, text=True, timeout=20).stdout.strip()
+                                 capture_output=True, text=True, encoding="utf-8",
+                                 errors="replace", timeout=20).stdout.strip()
             d = json.loads(out) if out else {}
             if isinstance(d, dict):
                 data.update(d)

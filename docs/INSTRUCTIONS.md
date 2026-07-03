@@ -150,9 +150,27 @@ and what you follow when writing your own:
 > `net`/`whea`/`power`/`vm`/`usb`/`storage`/`procs` to psutil/lm-sensors/journalctl — see
 > `docs/RECREATE-LINUX.md`.
 
----
+### Non-English Windows (locale) robustness
 
-## 4. Creating & editing a collector
+The fleet was audited file-by-file for English-locale dependence (developed/tested on English
+Windows only — treat first output on a localized box as something to eyeball once). The rules,
+in order of what actually breaks:
+
+- **Never parse localized text.** `Get-Counter` **paths** are localized (`cpu` translates
+  counter *indices* through `HKLM\...\Perflib\009` — the English list every locale ships — as
+  its fallback); `ping.exe`/`tpmtool` console output is MUI-localized (`net` uses CIM
+  `Win32_PingStatus`, `tpm` falls back to the never-localized `ACPI\MSFT0101` device ID);
+  event **Message** text is localized (`whea` matches numeric `Level`, never display strings).
+- **Pin the pipe encoding.** PS 5.1 emits redirected stdout in the console **OEM** codepage
+  while Python's `text=True` decodes with the **ANSI** codepage; any non-ASCII byte (event
+  message, VM name, process name) either mojibakes or kills the whole payload. Collectors that
+  ship free text prepend `[Console]::OutputEncoding=[Text.Encoding]::UTF8;` and decode
+  `encoding="utf-8", errors="replace"` (contract rule 5).
+- **Locale-stable by construction (verified, don't "fix"):** CIM numeric properties;
+  `ConvertTo-Json` number formatting (invariant, never culture decimal-commas);
+  Storage-cmdlet enum strings (`HealthStatus`/`MediaType` are .NET enum names);
+  `Get-NetAdapter LinkSpeed` (invariant format string); output of non-Windows CLIs
+  (`docker`, `kubectl`, `nvidia-smi`, `ssh`, Linux commands over WSL).
 
 ### 4.1 The minimal template
 

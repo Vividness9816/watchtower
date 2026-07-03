@@ -5,14 +5,26 @@ import json, subprocess, re, platform, socket, time, threading
 
 
 def ping(host="1.1.1.1", timeout=5):
-    n = "-n" if platform.system() == "Windows" else "-c"
-    # bound the ICMP wait itself (-w ms on Windows, -W s on Linux) so a dead host returns fast —
-    # the gateway ping runs AFTER the concurrent probes join, so it must not add ~5s and risk
-    # tripping sysdiag's 25s collector kill.
-    w = ["-w", str(timeout * 1000)] if platform.system() == "Windows" else ["-W", str(timeout)]
+    if platform.system() == "Windows":
+        # ping.exe's reply text is MUI-localized ("Zeit=12ms" / "время=12мс") so parsing it dies
+        # on non-English Windows; CIM Win32_PingStatus returns numeric StatusCode/ResponseTime on
+        # every locale. Keep the subprocess cap at timeout+1 so the post-join gateway call keeps
+        # the original 24s worst case under sysdiag's 25s kill — the only calls the tight cap can
+        # kill are dead-host ones whose correct answer is None anyway.
+        ps = (f"Get-CimInstance Win32_PingStatus -Filter \"Address='{host}' AND Timeout={timeout * 1000}\" "
+              "-EA SilentlyContinue | Select-Object StatusCode,ResponseTime | ConvertTo-Json -Compress")
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=timeout + 1).stdout.strip()
+            d = json.loads(out) if out else {}
+            # ping.exe reports sub-ms as "time<1ms" -> the old regex returned 1; max(1, rt) keeps
+            # the output identical (ResponseTime=0 means <1ms), and 0 would be falsy downstream.
+            return max(1, int(d.get("ResponseTime") or 0)) if d.get("StatusCode") == 0 else None
+        except Exception:
+            return None
     try:
-        out = subprocess.run(["ping", n, "1", *w, host], capture_output=True, text=True,
-                             timeout=timeout + 1).stdout
+        out = subprocess.run(["ping", "-c", "1", "-W", str(timeout), host],
+                             capture_output=True, text=True, timeout=timeout + 1).stdout
         m = re.search(r"time[=<]\s*(\d+)\s*ms", out)   # "time=12ms" / "time<1ms"
         return int(m.group(1)) if m else None
     except Exception:

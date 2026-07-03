@@ -10,7 +10,10 @@ import json, subprocess
 
 # Get-VM may be missing entirely (Hyper-V role not installed) -> the whole block throws and
 # we degrade. Per VM we pull state + the three encryption-relevant security flags.
+# VM names are operator text (can be non-ASCII); PS 5.1 emits them in the console OEM codepage
+# when redirected — force UTF-8 on both sides of the pipe or one accented name kills the payload.
 ps = (
+    r"[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
     r"if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) { '[]'; exit }"
     r"$vms = Get-VM | ForEach-Object {"
     r"  $s = $null; try { $s = Get-VMSecurity -VMName $_.Name -ErrorAction SilentlyContinue } catch {}"
@@ -26,7 +29,8 @@ ps = (
 )
 try:
     out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True, timeout=20).stdout.strip()
+                         capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         timeout=20).stdout.strip()
     vms = json.loads(out) if out and out != "[]" else []
     if isinstance(vms, dict):
         vms = [vms]
