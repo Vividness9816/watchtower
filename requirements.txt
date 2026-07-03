@@ -4,7 +4,7 @@
 torch
 gradio
 pandas
-sqlite-vec   # vector store for rag.py (see RECREATE-WINDOWS.md / RECREATE-LINUX.md §13)
+sqlite-vec   # vector store for rag.py (see RECREATE-WINDOWS.md / RECREATE-LINUX.md §12)
 
 # Linux ONLY — the Linux collectors use psutil instead of PowerShell/CIM. Uncomment on Linux:
 # psutil
