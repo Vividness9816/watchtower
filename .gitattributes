@@ -1,0 +1,6 @@
+# Keep the frozen exam byte-identical across platforms — its SHA256 manifest
+# (exam/freeze_manifest.json) is checked every run, and a CRLF rewrite on a
+# fresh clone would fail verify_frozen(). Force LF on everything the manifest hashes.
+exam/** -text
+corpus.txt -text
+vocab.json -text
