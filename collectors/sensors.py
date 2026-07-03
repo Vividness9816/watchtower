@@ -13,7 +13,7 @@ CATEGORIES = {"Temperatures", "Fans", "Voltages", "Powers", "Clocks", "Load", "L
               "Controls", "Levels", "Data", "Rates", "Throughput", "Factors", "Times"}
 
 
-def walk(node, temps, fans, hw=""):
+def walk(node, temps, fans, volts, powers, hw=""):
     name, val = node.get("Text", ""), node.get("Value", "")
     m = re.match(r"\s*(-?\d+(?:[.,]\d+)?)\s*(\S+)?", val) if val else None
     if m:
@@ -23,11 +23,15 @@ def walk(node, temps, fans, hw=""):
             temps[key] = num
         elif unit == "RPM":
             fans[key] = int(num)
+        elif unit == "V":                        # rail voltages: 12V/5V/Vcore sag = PSU warning
+            volts[key] = num
+        elif unit == "W":                        # CPU package / GPU board power
+            powers[key] = num
     kids = node.get("Children", [])
     if kids and not m and name and name not in CATEGORIES:
         hw = name                                # nearest hardware node names the sensor
     for ch in kids:
-        walk(ch, temps, fans, hw)
+        walk(ch, temps, fans, volts, powers, hw)
 
 
 def pick(d, *words):  # first value whose key contains ALL words (case-insensitive)
@@ -55,10 +59,10 @@ def liquidctl_read():  # (liquid_temp, pump_rpm, note) — degrades to (None, No
     return None, None, None
 
 
-temps, fans, lhm_err = {}, {}, None
+temps, fans, volts, powers, lhm_err = {}, {}, {}, {}, None
 try:
     with urllib.request.urlopen(LHM_URL, timeout=3) as r:
-        walk(json.loads(r.read().decode("utf-8", "replace")), temps, fans)
+        walk(json.loads(r.read().decode("utf-8", "replace")), temps, fans, volts, powers)
 except Exception as e:
     lhm_err = f"LHM not reachable: {e}"
 
@@ -74,7 +78,7 @@ if liquid is None:
     pump = pump if pump is not None else pump2
 
 out = {"cpu_temp": int(max(cpu_matches)) if cpu_matches else None,
-       "fans": fans, "temps": temps,
+       "fans": fans, "temps": temps, "voltages": volts, "powers": powers,
        "liquid_temp": liquid, "pump_rpm": pump}
 if aio_note:
     out["aio_note"] = aio_note

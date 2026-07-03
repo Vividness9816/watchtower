@@ -1,0 +1,28 @@
+{
+ "run": 5,
+ "ts": "2026-07-02T22:10:12",
+ "dims_run": [
+  "s1",
+  "s6"
+ ],
+ "dims_inherited": [
+  "s2",
+  "s3",
+  "s4",
+  "s5",
+  "s7"
+ ],
+ "frozen_ok": true,
+ "scores": {
+  "s1": 0.9494,
+  "s2": 1.0,
+  "s3": 0.9931,
+  "s4": 0.7924,
+  "s5": 1.0,
+  "s6": 1.0,
+  "s7": 1.0
+ },
+ "composite": 0.9703,
+ "note": "coverage: sensors voltages+powers, tpm via tpmtool (truth fix), wsl vhdx via Lxss registry",
+ "seconds": 59.7
+}

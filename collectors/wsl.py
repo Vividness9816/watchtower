@@ -16,13 +16,32 @@ def _vmmem_gb():
 
 
 def _vhdx_gb():
-    # the per-distro ext4.vhdx under %LOCALAPPDATA%\Packages\*\LocalState (Store distros) or
-    # a registry BasePath; sum whatever ext4 disks exist. Best-effort, read-only.
-    total = 0
-    found = False
+    # Sum every WSL distro's *.vhdx. Store distros live under %LOCALAPPDATA%\Packages\*\LocalState;
+    # others (incl. Docker Desktop's) register a BasePath under HKCU\...\Lxss\{guid}. Read both.
+    paths = set()
     base = os.path.expandvars(r"%LOCALAPPDATA%\Packages")
-    for p in glob.glob(os.path.join(base, "*", "LocalState", "ext4.vhdx")) + \
-            glob.glob(os.path.join(base, "*", "LocalState", "*.vhdx")):
+    for p in glob.glob(os.path.join(base, "*", "LocalState", "*.vhdx")):
+        paths.add(p)
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Lxss")
+        for i in range(winreg.QueryInfoKey(key)[0]):
+            sub = winreg.OpenKey(key, winreg.EnumKey(key, i))
+            try:
+                bp = winreg.QueryValueEx(sub, "BasePath")[0]
+                bp = os.path.expandvars(bp.replace("\\\\?\\", ""))
+                for p in glob.glob(os.path.join(bp, "*.vhdx")):
+                    paths.add(p)
+            except OSError:
+                pass
+            finally:
+                winreg.CloseKey(sub)
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+    total, found = 0, False
+    for p in paths:
         try:
             total += os.path.getsize(p)
             found = True

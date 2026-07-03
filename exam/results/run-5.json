@@ -1,0 +1,41 @@
+{
+ "run": 5,
+ "ts": "2026-07-02T22:10:12",
+ "frozen_ok": true,
+ "scores": {
+  "s1": 0.9494,
+  "s6": 1.0
+ },
+ "composite": null,
+ "detail": {
+  "s1": {
+   "present": 75,
+   "total": 79,
+   "missing": [
+    "gpu.rebar",
+    "os.ntp_offset_ms",
+    "security.bitlocker_c",
+    "security.failed_logons_24h"
+   ]
+  },
+  "s6": {
+   "checks": {
+    "schema_demo": true,
+    "rules_demo": true,
+    "live_demo": true,
+    "fast_tier_under_5s": true,
+    "full_fleet_under_30s": true,
+    "full_fleet_low_errors": true,
+    "history_write_hermetic": true,
+    "trends_read_hermetic": true,
+    "ui_render_robust": true,
+    "deltas_correct": true,
+    "exit_code_contract": true,
+    "ingest_loopback": true,
+    "ship_env_precedence": true
+   },
+   "fast_s": 4.9,
+   "full_s": 9.34
+  }
+ }
+}
