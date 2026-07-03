@@ -1,0 +1,37 @@
+# CI — two jobs:
+#   fast:        every module self-test + security + fixture + stress suites. No torch — the
+#                whole non-GPT surface needs only gradio/pandas/sqlite-vec (~1 min install).
+#   torch-smoke: the tiny-GPT stack on the CPU torch wheel (forward/backward). Heavier install,
+#                so it's a separate job; a failure here doesn't block the fast signal.
+# The frozen exam (exam/run_exam.py) is NOT run here: it needs this box's real sensors, a GPU
+# and Ollama. CI proves the logic; the exam proves the product on real hardware.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install gradio pandas sqlite-vec
+      - run: python tests/run_all.py
+
+  torch-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - run: python tests/torch_smoke.py
