@@ -3,7 +3,7 @@
 
   "host": "lab-pc-01",
   "label": "Lab PC — rack 2, GPU node",
-  "tags": { "location": "basement", "role": "gpu-node", "owner": "dylan" },
+  "tags": { "location": "basement", "role": "gpu-node", "owner": "ops" },
 
   "fast": ["cpu", "gpu", "mem", "sensors", "disk"],
   "full": null,

@@ -160,8 +160,8 @@ The exam is a proxy; these were verified by driving the real system:
     disk 6 %, load 1.08, mem 22 %, uptime, kernel `6.6.114.1-microsoft-standard-WSL2`, all
     threshold-checked into the snapshot.
   - **Ship → ingest (`ship.py`)** — ran the agent inside WSL shipping to the Windows receiver over
-    real cross-machine networking (`172.30.128.1:7863`). The receiver created a separate
-    `wsl-ubuntu` per-host ring; when the agent stopped, the host flagged **STALE** with the exact
-    "agent stopped shipping 30s ago — data is STALE" note the GUI/chat would show.
+    real cross-machine networking (the WSL→Windows gateway IP, port 7863). The receiver created a
+    separate `wsl-ubuntu` per-host ring; when the agent stopped, the host flagged **STALE** with the
+    exact "agent stopped shipping 30s ago — data is STALE" note the GUI/chat would show.
   - **NiFi** — config-validated (the two-processor `ListenHTTP → InvokeHTTP` flow is documented);
     not exercised against a live NiFi instance.

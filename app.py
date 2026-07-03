@@ -166,7 +166,7 @@ with gr.Blocks(title="Watch Tower") as app:
     with gr.Accordion("📝 Shared notes — leave a note for other users of this dashboard", open=False):
         notes_md = gr.Markdown(render_notes())
         with gr.Row():
-            n_user = gr.Textbox(label="Your name", placeholder="e.g. dylan", scale=1)
+            n_user = gr.Textbox(label="Your name", placeholder="e.g. alex", scale=1)
             n_text = gr.Textbox(label="Note", placeholder="e.g. RMA'd the NZXT pump — AIO temps are stale",
                                 scale=3, lines=1)
         n_btn = gr.Button("Post note", variant="primary")
