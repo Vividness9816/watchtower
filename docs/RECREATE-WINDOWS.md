@@ -4401,7 +4401,7 @@ notes.db
 rag_index.db
 *.db-journal
 
-# Large generated/scraped RAG corpora (regenerable; see docs/RECREATE-*.md §13).
+# Large generated/scraped RAG corpora (regenerable; see docs/RECREATE-*.md §12).
 # rag.py still indexes these locally via its *.md glob — they're just kept out of git.
 powershell-docs-merged.md
 arch-wiki-merged.md
