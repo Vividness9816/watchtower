@@ -3373,7 +3373,7 @@ with gr.Blocks(title="Watch Tower") as app:
     with gr.Accordion("📝 Shared notes — leave a note for other users of this dashboard", open=False):
         notes_md = gr.Markdown(render_notes())
         with gr.Row():
-            n_user = gr.Textbox(label="Your name", placeholder="e.g. dylan", scale=1)
+            n_user = gr.Textbox(label="Your name", placeholder="e.g. alex", scale=1)
             n_text = gr.Textbox(label="Note", placeholder="e.g. RMA'd the NZXT pump — AIO temps are stale",
                                 scale=3, lines=1)
         n_btn = gr.Button("Post note", variant="primary")
@@ -3736,7 +3736,7 @@ if __name__ == "__main__":
 
   "host": "lab-pc-01",
   "label": "Lab PC — rack 2, GPU node",
-  "tags": { "location": "basement", "role": "gpu-node", "owner": "dylan" },
+  "tags": { "location": "basement", "role": "gpu-node", "owner": "ops" },
 
   "fast": ["cpu", "gpu", "mem", "sensors", "disk"],
   "full": null,

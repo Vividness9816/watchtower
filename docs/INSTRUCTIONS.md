@@ -544,7 +544,7 @@ text: e.g. `python sysdiag.py; if ($LASTEXITCODE -ge 2) { <page me> }`.
 Both are in the dashboard (accordions under the History graph) and scriptable:
 ```
 python -c "import search; [print(r) for r in search.search(component='gpu.temp', host='lab-pc', since='2026-07-01T00:00:00')]"
-python -c "import notes; notes.add_note('dylan', 'RMA pending on the NZXT pump'); print(notes.list_notes())"
+python -c "import notes; notes.add_note('alex', 'RMA pending on the AIO pump'); print(notes.list_notes())"
 ```
 Search matches `component` as a substring of the metric's dotted path (`cpu_temp`, `gpu`, `disk`,
 `docker`…); blank fields mean *any*. Both read/write `history.db` / `notes.db` (override paths with
