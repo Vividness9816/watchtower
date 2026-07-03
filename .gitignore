@@ -9,7 +9,10 @@ ckpt.pt
 *.pt
 *.safetensors
 history.db
-rag_index.db          # RAG embedding cache — regenerate with `python rag.py --build`
+history.log
+# RAG embedding cache — regenerate with `python rag.py --build`
+# (a trailing comment on the pattern line breaks the match: gitignore comments must be whole-line)
+rag_index.db
 *.db-journal
 
 # Large generated/scraped RAG corpora (regenerable; see docs/RECREATE-*.md §13).
