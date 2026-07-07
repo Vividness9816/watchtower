@@ -33,6 +33,8 @@ nvidia-smi.md
 
 # Local agent / security-sweep artifacts (never commit)
 .claude/
+# Session handoff notes — carry local paths/usernames scrubbed from the public mirror
+HANDOFF.md
 
 # Secrets / env
 .env
